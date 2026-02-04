@@ -77,11 +77,16 @@ https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/inspection.mp4
 
 ```text
 src/
- ├─ iccbf/              # ICCBF core implementation
- ├─ metarl/             # Meta-RL training and policies
+ ├─ data/              # All .mat files and initial state sets stored here
  ├─ cruise_control/     # Cruise control experiments
  ├─ docking/            # Docking & final approach
  └─ inspection/         # Inspection task + evaluation
+Notebooks/
+ ├─ TrainedModels  # stores trainedmodels from the notebooks
+ ├─ cruise_control.ipynb  # cruise control problem 
+ ├─ docking.ipynb  #docking problem 
+ ├─ inspection.ipynb #inspection problem
+ ├─ images #plots used in the jupyter notebooks
 media/
  ├─ cruise_control.mp4
  ├─ docking.mp4
