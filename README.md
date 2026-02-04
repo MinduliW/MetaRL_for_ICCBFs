@@ -1,7 +1,7 @@
 # Meta-Reinforcement Learning for Input-Constrained Control Barrier Functions (ICCBFs)
 
 <p align="center">
-  <b>Safe, fuel-efficient, and recoverable autonomy for spacecraft proximity operations</b>
+  <b>Robust & fuel-efficient autonomy for spacecraft proximity operations</b>
 </p>
 
 <p align="center">
