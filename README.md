@@ -32,7 +32,7 @@ The result is **non-greedy, fuel-efficient, and safe autonomy** for realistic mi
 ## 🎥 Demos (Real rollouts)
 
 ### Cruise Control (Input-constrained safety)
-![Demo](media/CCgif.gif)
+![Demo](media/CCGif.gif)
 
 
 ---
