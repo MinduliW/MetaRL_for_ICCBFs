@@ -1,0 +1,32 @@
+name: iccbf-notebooks
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - jupyter
+  - ipykernel
+  - cvxpy
+  - astropy
+  - tqdm
+  - pyyaml
+  # conda-only / painful-on-pip
+  - ipopt
+  - nlopt
+  - pagmo
+  - pygmo
+  - pykep
+  # optional, only if you truly depend on it in notebooks
+  # - daceypy
+  - pip:
+      - gymnasium
+      - stable-baselines3
+      - torch
+      - sympy
+      - symengine
+
+
