@@ -32,7 +32,7 @@ The result is **non-greedy, fuel-efficient, and safe autonomy** for realistic mi
 ## 🎥 Demos (Real rollouts)
 
 ### Cruise Control (Input-constrained safety)
-https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/cruise_control.mp4
+https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/cruise_control_RNN.mp4
 
 ---
 
