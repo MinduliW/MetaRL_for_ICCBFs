@@ -21,9 +21,10 @@ This repository contains the reference implementation for **Meta-Reinforcement L
 - On-orbit inspection with keep-out, keep-in, and illumination constraints
 
 The framework combines:
-- **Provable safety guarantees** via ICCBFs  
+- **Empirically safety guarantees** via ICCBFs  
 - **Long-horizon performance awareness** via meta-learned class-𝒦 parameters  
-- **Recoverability beyond conservative invariant sets** using learned residual barriers  
+- **Recoverability beyond conservative invariant sets** using learned residual barriers
+- - **Robustness to hidden parameters and noise** using recurrent neural networks
 
 The result is **non-greedy, fuel-efficient, and safe autonomy** for realistic mission profiles.
 
