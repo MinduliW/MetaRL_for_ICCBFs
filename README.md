@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="media/header.gif" alt="Demo header" width="100%">
+  <img src="media/header.drawio.png" alt="Demo header" width="100%">
 </p>
-
-# Meta-Reinforcement Learning for Input-Constrained Control Barrier Functions (ICCBFs)
 
 <p align="center">
   <b>Robust & fuel-efficient autonomy for spacecraft proximity operations</b>
