@@ -69,7 +69,6 @@ This is my favourite test case. The first result has no ICCBF tunning, and achei
 
 - **Meta-RL tuning of ICCBF decay parameters**
   - Learns state-dependent class-𝒦 functions
-  - Preserves forward invariance of certified safe sets
 
 - **Recoverability beyond conservative invariant sets**
   - Enables safe task completion from a subset of traditionally abandoned states
