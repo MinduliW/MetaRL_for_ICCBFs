@@ -43,7 +43,23 @@ https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/docking.mp4
 ---
 
 ### Autonomous Inspection (KOZ, KIZ, Sun constraints)
+
+This is my favourite test case. The first result has no ICCBF tunning, and acheives the inspection score very fast, but at a high fuel cost. The second one shows ICCBF tunning with MLP, which is not very successful. It lowers fuel consumption at the cost of inspection score. The last one is where ICCBF is tunned by RNN, here, the RNN is able to both lower the fuel consumption while still satisfying full inspection 75% of the time. The inspection takes longer of course compared to the first case, but it reaches completion. This defines a nongreedy control barrier system.
+
+![Demo](media/inspectionuRL.gif)
+*Figure: ICCBF inspection trajectories where only the nominal control is determined by RL. No ICCBF tuning. Cyan indicates task completion; blue indicates in-progress inspection.*
+
+
+
+![Demo](media/inspectionNN.gif)
+*Figure: NN-tuned ICCBF inspection trajectories. Cyan indicates task completion; blue indicates in-progress inspection.*
+
+
 ![Demo](media/inspectionRNN.gif)
+*Figure: RNN-tuned ICCBF inspection trajectories. Cyan indicates task completion; blue indicates in-progress inspection.*
+
+
+
 
 ---
 
