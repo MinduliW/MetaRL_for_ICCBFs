@@ -43,7 +43,7 @@ https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/docking.mp4
 ---
 
 ### Autonomous Inspection (KOZ, KIZ, Sun constraints)
-https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/inspection.mp4
+![Demo](media/inspectionRNN.gif)
 
 ---
 
