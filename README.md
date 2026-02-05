@@ -38,7 +38,8 @@ The result is **non-greedy, fuel-efficient, and safe autonomy** for realistic mi
 ---
 
 ### Docking & Final Approach
-https://github.com/MinduliW/MetaRL_for_ICCBFs/raw/main/media/docking.mp4
+![Demo](media/docking.gif)
+
 
 ---
 
