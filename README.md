@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/header.gif" alt="Demo header" width="100%">
+</p>
+
 # Meta-Reinforcement Learning for Input-Constrained Control Barrier Functions (ICCBFs)
 
 <p align="center">
