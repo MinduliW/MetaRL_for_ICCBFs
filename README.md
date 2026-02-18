@@ -14,7 +14,7 @@
 
 ---
 
-## 🚀 Overview
+## Overview
 
 This repository contains the reference implementation for **Meta-Reinforcement Learning–aided Input-Constrained Control Barrier Functions (ICCBFs)** applied to **safety-critical spacecraft proximity operations**, including:
 
@@ -67,7 +67,49 @@ This is my favourite test case. The first result has no ICCBF tuning and achieve
 
 ---
 
-## 🧠 Key Contributions
+## Installation
+
+### Prerequisites
+
+- Python 3.11 or 3.12
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+- NVIDIA GPU with CUDA 12.8 toolkit (for mamba-ssm / CUDA extensions)
+- `swig` (for box2d-py): `sudo apt install swig`
+
+### Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/<your-username>/MetaRL_for_ICCBFs.git
+cd MetaRL_for_ICCBFs
+
+# Install dependencies
+uv sync
+
+# (Optional) Install gymnasium rendering extras (pygame, box2d)
+uv sync --extra envs
+
+# (Optional) Install dev tools (pytest, ruff)
+uv sync --extra dev
+```
+
+### CUDA extensions (mamba-ssm)
+
+If mamba-ssm needs to build from source (no precompiled wheel available), set `CUDA_HOME` to your CUDA 12.8 toolkit:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 uv sync
+```
+
+### Verify installation
+
+```bash
+uv run python -c "import metarl_iccbf; import mamba_ssm; import torch; print('All good')"
+```
+
+---
+
+## Key Contributions
 
 - **Meta-RL tuning of ICCBF decay parameters**
   - Learns state-dependent class-𝒦 functions
@@ -83,7 +125,7 @@ This is my favourite test case. The first result has no ICCBF tuning and achieve
 
 ---
 
-## 📊 Representative Results
+## Representative Results
 
 - Strong reduction in median and tail Δv consumption
 - High rate of inspection completion rates for learned ICCBFs, with lower fuel consumption
