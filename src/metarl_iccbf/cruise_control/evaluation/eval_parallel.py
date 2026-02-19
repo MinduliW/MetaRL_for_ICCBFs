@@ -5,7 +5,7 @@ import numpy as np
 import multiprocessing as mp
 import queue as pyqueue
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple, List
+from typing import Tuple
 
 from tqdm import tqdm
 from scipy.io import savemat
@@ -17,7 +17,8 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from stable_baselines3 import PPO
-from RLCBF import RLCBFcontrol
+from metarl_iccbf.cruise_control.envs.rlcbf_env import RLCBFcontrol
+
 
 # ------------------- Globals in each worker -------------------
 _MODEL = None
@@ -32,8 +33,7 @@ def _init_worker(progress_q, cfg):
     _CFG = cfg
 
     _MODEL = PPO.load(cfg.model_path, device="cpu")
-    _ENV = RLCBFcontrol(dt=cfg.dt, deterministic=True)  # deterministic eval env
-# --------------------------------------------------------------
+    _ENV = RLCBFcontrol(dt=cfg.dt, deterministic=True)
 
 
 @dataclass
@@ -44,14 +44,12 @@ class EvalConfig:
     TOF: float = 40.0
 
     n_workers: int = 8
-    n_chunks: int = 32                 # more chunks => better load balance
-    base_seed: int = 12345             # episode noise seed = base_seed + global_i
+    n_chunks: int = 32
+    base_seed: int = 12345
     deterministic_policy: bool = True
 
-    # progress updates
     progress_update_every: int = 1
 
-    # output
     out_dir: str = "ResultsEval"
     out_mat: str = "NoiseMetaICCBFMargin_NN_fixedICs_parallel.mat"
 
@@ -69,7 +67,6 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
     lenvec = int(cfg.TOF / cfg.dt)
     K = idxs.shape[0]
 
-    # Allocate chunk buffers (same structure as your single-process code, but chunked)
     uOpts = np.zeros((K, lenvec, 1), dtype=np.float64)
     states = np.zeros((K, lenvec, 2), dtype=np.float64)
     uOptmag = np.zeros((K, lenvec), dtype=np.float64)
@@ -80,18 +77,15 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
     comptimes = np.zeros((K, lenvec), dtype=np.float64)
     steps_taken = np.zeros((K,), dtype=np.int32)
 
-    # progress batching
     local_done = 0
     batch = max(1, int(cfg.progress_update_every))
 
     for j, global_i in enumerate(idxs):
-        d0, v0 = ics[global_i, :]
+        d0, v0 = ics[int(global_i), :]
         ep_seed = int(cfg.base_seed + int(global_i))
 
-        # Seed env RNG so sensor/actuation noise is reproducible per episode
         obs, _ = env.reset(seed=ep_seed, postProcess=False)
 
-        # Force the fixed initial condition
         env.x0 = np.array([d0, v0], dtype=float)
         obs = env.scaleObservation(env.x0)
 
@@ -107,12 +101,13 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
             obs, reward_temp, done, _, _ = env.step(action)
             comptimes[j, step - 1] = time.perf_counter() - t0
 
-            # store
             states[j, step - 1, :] = env.x0
             actionStore[j, step - 1, :] = action
-            uOpts[j, step - 1, 0] = float(env.u)
-            mag = float(np.linalg.norm(env.u))
-            uOptmag[j, step - 1] = mag
+
+            # env.u might be scalar or vector; store robustly
+            u_arr = np.atleast_1d(env.u).astype(float)
+            uOpts[j, step - 1, 0] = float(u_arr[0])
+            uOptmag[j, step - 1] = float(np.linalg.norm(u_arr))
 
             hs[j, step - 1, 0] = float(env.x0[0] - 1.8 * env.x0[1])
             Vs[j, step - 1, 0] = float((env.x0[1] - env.vmax) ** 2)
@@ -124,7 +119,6 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
         steps_taken[j] = step
         uTotal[j, 0] = float(np.sum(uOptmag[j, :step]) * cfg.dt)
 
-        # progress update
         local_done += 1
         if _PROGRESS_Q is not None and (local_done % batch == 0):
             _PROGRESS_Q.put(batch)
@@ -133,7 +127,6 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
     if _PROGRESS_Q is not None and rem != 0:
         _PROGRESS_Q.put(rem)
 
-    # Save chunk to disk (fast, avoids giant IPC transfers)
     np.savez_compressed(
         chunk_path,
         idxs=idxs,
@@ -153,7 +146,13 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
 def evaluate_parallel(cfg: EvalConfig):
     os.makedirs(cfg.out_dir, exist_ok=True)
 
-    ics = np.load(cfg.ics_path)
+    # Load ICs robustly: allow .npy or .npz with 'ics'
+    if cfg.ics_path.endswith(".npz"):
+        D = np.load(cfg.ics_path, allow_pickle=True)
+        ics = D["ics"] if "ics" in D.files else D[D.files[0]]
+    else:
+        ics = np.load(cfg.ics_path)
+
     if not (ics.ndim == 2 and ics.shape[1] == 2):
         raise ValueError(f"IC file must be shape (N,2). Got {ics.shape}")
 
@@ -165,14 +164,11 @@ def evaluate_parallel(cfg: EvalConfig):
     print(f"Model: {cfg.model_path}")
     print(f"Workers: {cfg.n_workers}, chunks: {cfg.n_chunks}")
 
-    # Prepare chunk index sets
     all_idxs = np.arange(N, dtype=np.int64)
     chunks = np.array_split(all_idxs, max(cfg.n_chunks, cfg.n_workers))
 
-    # Temporary chunk files
     chunk_dir = os.path.join(cfg.out_dir, "_chunks_tmp")
     os.makedirs(chunk_dir, exist_ok=True)
-    # clear old tmp chunks
     for f in glob.glob(os.path.join(chunk_dir, "chunk_*.npz")):
         try:
             os.remove(f)
@@ -189,7 +185,6 @@ def evaluate_parallel(cfg: EvalConfig):
     ctx = mp.get_context("spawn")
     progress_q = ctx.Queue()
 
-    # Run pool
     with ctx.Pool(
         processes=cfg.n_workers,
         initializer=_init_worker,
@@ -210,11 +205,10 @@ def evaluate_parallel(cfg: EvalConfig):
                 if all(r.ready() for r in async_results):
                     break
 
-            chunk_files = [r.get() for r in async_results]  # propagate worker exceptions
+            chunk_files = [r.get() for r in async_results]
         finally:
             pbar.close()
 
-    # Allocate full buffers (same shapes as your original evaluation)
     uOpts = np.zeros((N, lenvec, 1), dtype=np.float64)
     states = np.zeros((N, lenvec, 2), dtype=np.float64)
     uTotal = np.zeros((N, 1), dtype=np.float64)
@@ -224,7 +218,6 @@ def evaluate_parallel(cfg: EvalConfig):
     comptimes = np.zeros((N, lenvec), dtype=np.float64)
     steps_taken = np.zeros((N,), dtype=np.int32)
 
-    # Stitch chunk files back to global arrays
     for cf in chunk_files:
         data = np.load(cf, allow_pickle=False)
         idxs = data["idxs"]
@@ -238,7 +231,6 @@ def evaluate_parallel(cfg: EvalConfig):
         comptimes[idxs, :] = data["comptimes"]
         steps_taken[idxs] = data["steps_taken"]
 
-    # Summaries
     print("Completed:", N, "episodes")
     print("uTotal mean:", float(np.mean(uTotal)))
     print("uTotal q25/q50/q75:", np.percentile(uTotal, [25, 50, 75]).tolist())
@@ -258,25 +250,4 @@ def evaluate_parallel(cfg: EvalConfig):
         "model_path": np.array([cfg.model_path], dtype=object),
     })
     print("Saved:", out_path)
-
-    # Optional: remove chunk files after merge
-    # for cf in chunk_files:
-    #     try: os.remove(cf)
-    #     except OSError: pass
-
-
-if __name__ == "__main__":
-    cfg = EvalConfig(
-        ics_path="fixed_initial_conditions_N5000_seed123.npy",
-        model_path="TrainedModels/MetaCNNCruiseControlMargin_PPO_L3_N64_Tanh_lr0.0001_g0.999_gae0.990_ent0.01/best_model.zip",
-        dt=0.1,
-        TOF=40.0,
-        n_workers=8,
-        n_chunks=32,                 # good balance for 8 workers
-        base_seed=12345,
-        deterministic_policy=True,
-        progress_update_every=1,
-        out_dir="ResultsEval",
-        out_mat="NoiseMetaICCBFMargin_NN_fixedICs_parallel.mat",
-    )
-    evaluate_parallel(cfg)
+    return out_path

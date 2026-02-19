@@ -135,21 +135,18 @@ uv run python -c "import metarl_iccbf; import mamba_ssm; import torch; print('Al
 
 ---
 
-## 🗂 Repository Structure
+## Citation
 
-```text
-src/
- ├─ data/              # All .mat files and initial state sets stored here
- ├─ cruise_control/     # Cruise control experiments
- ├─ docking/            # Docking & final approach
- └─ inspection/         # Inspection task + evaluation
-Notebooks/
- ├─ TrainedModels  # stores trainedmodels from the notebooks
- ├─ cruise_control.ipynb  # cruise control problem 
- ├─ docking.ipynb  #docking problem 
- ├─ inspection.ipynb #inspection problem
- ├─ images #plots used in the jupyter notebooks
-media/
- ├─ cruise_control.mp4
- ├─ docking.mp4
- └─ inspection.mp4
+If you use this code in your research, please cite our work:
+
+```bibtex
+@misc{wijayatunga2026metareinforcementlearningrobustnongreedy,
+      title={Meta-Reinforcement Learning for Robust and Non-greedy Control Barrier Functions in Spacecraft Proximity Operations}, 
+      author={Minduli C. Wijayatunga and Richard Linares and Roberto Armellin},
+      year={2026},
+      eprint={2602.07335},
+      archivePrefix={arXiv},
+      primaryClass={eess.SY},
+      url={https://arxiv.org/abs/2602.07335}, 
+}
+```

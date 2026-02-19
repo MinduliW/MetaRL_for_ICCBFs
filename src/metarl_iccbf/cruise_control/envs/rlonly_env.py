@@ -18,11 +18,10 @@ from scipy.optimize import minimize
 from scipy.integrate import trapezoid
 from scipy import integrate
 # from iccbfs import ICCBF
-from iccbftune import ICCBF
+from metarl_iccbf.cruise_control.iccbf import ICCBF
 # from ya import YA
 # My Classes
 # from propagations import Propagations
-from supportfcn import supportFcn
 
 class RLCBFcontrol(gym.Env):
     

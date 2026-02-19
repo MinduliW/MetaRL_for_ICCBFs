@@ -30,7 +30,7 @@ from tqdm import tqdm
 from scipy.io import savemat
 
 # Your env (adjust path/import if needed)
-from RLCBF import RLCBFcontrol
+from metarl_iccbf.cruise_control.envs.rlcbf_env import RLCBFcontrol
 
 # SB3
 from stable_baselines3 import PPO

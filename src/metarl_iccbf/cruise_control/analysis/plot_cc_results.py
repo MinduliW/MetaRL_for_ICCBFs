@@ -1,4 +1,4 @@
-# src/cruisecontrol/plot_cc_results.py
+# src/metarl_iccbf/cruise_control/analysis/plot_cc_results.py
 """
 Cruise-control plotting utilities (Python port of your MATLAB visualisation).
 
@@ -17,7 +17,7 @@ Given 3 .mat result files (ICCBF, MLP-tuned, RNN-tuned), this module:
 
 Usage (in a notebook)
 ---------------------
-from cruisecontrol.plot_cc_results import plot_cruisecontrol_threeway
+from metarl_iccbf.cruise_control.analysis.plot_cc_results import plot_cruisecontrol_threeway
 
 out = plot_cruisecontrol_threeway(
     baseline_mat="level4/NN_noRL_FIXEDSPEC.mat",

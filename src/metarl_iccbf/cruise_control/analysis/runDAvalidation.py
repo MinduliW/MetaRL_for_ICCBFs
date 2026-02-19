@@ -55,7 +55,7 @@ def plot_cruisecontrol_da_bound_violins(
         - saved: paths to PNG if save_prefix is set
     """
     # Import validator only when called
-    from cruisecontrol.validate_mc_da_bounds_boundary_cruise import validate_mc_boundary
+    from metarl_iccbf.cruise_control.analysis.validate_mc_da_bounds_boundary_cruise import validate_mc_boundary
 
     # Resolve default data directory
     if data_dir is None:

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from cruisecontrol.RLCBF import RLCBFcontrol  # adjust import path if needed
+from metarl_iccbf.cruise_control.envs.rlcbf_env import RLCBFcontrol
 
 
 def make_cruise_control_episode_bank(
