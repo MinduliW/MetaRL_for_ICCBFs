@@ -40,6 +40,11 @@ Thumbs.db
 *.log
 runs/
 wandb/
+outputs/
+notebooks/
+ResultsEval/
 
 # MuJoCo
 *.mjlog
+
+.claude/

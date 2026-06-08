@@ -16,7 +16,12 @@ from sb3_contrib import RecurrentPPO
 from sb3_contrib.ppo_recurrent import MlpLstmPolicy
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+
+try:
+    from wandb.integration.sb3 import WandbCallback
+except ImportError:
+    WandbCallback = None  # type: ignore
 
 
 # ---------------------------------------------------------------------
@@ -85,7 +90,7 @@ def train_cruise_control(
 
     # ---- Mamba2 parameters (only used when policy_type="MAMBA") ----
     mamba_d_model: int = 64,
-    mamba_d_state: int = 64,
+    mamba_d_state: int = 16,
     mamba_d_conv: int = 4,
     mamba_expand: int = 2,
     mamba_headdim: int = 64,
@@ -113,8 +118,9 @@ def train_cruise_control(
     trainLoad: bool = False,
 
     # ---- Logging ----
-    root_log_dir: str = "TrainedModels",
+    root_log_dir: str = "outputs/cruise_control",
     training_name: Optional[str] = None,
+    wandb_project: Optional[str] = None,
 ):
     """
     Train a cruise-control policy.
@@ -191,9 +197,6 @@ def train_cruise_control(
     # --------------------------------------------------
     if training_name is None:
         time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        act_name = getattr(activation_fn, "__name__", activation_fn.__class__.__name__)
-        arch_str = f"{policy_type}_L{layers}_N{nodes}_{act_name}"
-        hyper_str = f"lr{learning_rate:g}_g{gamma}_gae{gae_lambda}_ent{ent_coef}"
         if env_type == "rl_only":
             method_tag = "Baseline"
         elif policy_type == "MAMBA":
@@ -202,7 +205,7 @@ def train_cruise_control(
             method_tag = "RNNTunedICCBF"
         else:
             method_tag = "MLPTunedICCBF"
-        training_name = f"{method_tag}_CruiseControl_{arch_str}_{hyper_str}_{time_str}"
+        training_name = f"{method_tag}_CruiseControl_{time_str}"
 
     log_dir = Path(root_log_dir) / training_name
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -213,8 +216,8 @@ def train_cruise_control(
     # Model
     # --------------------------------------------------
     if policy_type == "MAMBA":  # Mamba2-Tuned ICCBF
-        from metarl_iccbf.mamba2.mamba_policy import Mamba2ActorCriticPolicy
-        from metarl_iccbf.mamba2.mamba_ppo import Mamba2PPO
+        from metarl_iccbf.mamba.mamba_policy import Mamba2ActorCriticPolicy
+        from metarl_iccbf.mamba.mamba_ppo import Mamba2PPO
 
         mamba_kwargs = dict(
             shared_lstm=shared_lstm,
@@ -298,7 +301,7 @@ def train_cruise_control(
     # --------------------------------------------------
     if trainLoad:
         if policy_type == "MAMBA":
-            from metarl_iccbf.mamba2.mamba_ppo import Mamba2PPO as _LoadCls
+            from metarl_iccbf.mamba.mamba_ppo import Mamba2PPO as _LoadCls
             load_cls = _LoadCls
         elif policy_type == "RNN":
             load_cls = RecurrentPPO
@@ -311,26 +314,69 @@ def train_cruise_control(
         )
 
     # --------------------------------------------------
+    # wandb
+    # --------------------------------------------------
+    if wandb_project is not None:
+        import wandb
+
+        wandb.init(
+            project=wandb_project,
+            name=training_name,
+            config=dict(
+                policy_type=policy_type,
+                env_type=env_type,
+                dt=dt,
+                seed=seed,
+                layers=layers,
+                nodes=nodes,
+                total_episodes=total_episodes,
+                learning_rate=learning_rate,
+                lr_type=lr_type,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                clip_range=clip_range,
+                ent_coef=ent_coef,
+                target_kl=target_kl,
+                n_epochs=n_epochs,
+                batch_size=batch_size,
+                n_steps=n_steps,
+                num_env=num_env,
+            ),
+            sync_tensorboard=True,
+        )
+
+    # --------------------------------------------------
     # Train
     # --------------------------------------------------
     if trainON:
-        callback = EvalCallback(
-            eval_env,
-            n_eval_episodes=10,
-            eval_freq=n_steps,
-            best_model_save_path=str(log_dir),
-            log_path=str(log_dir),
-            deterministic=True,
-            verbose=1,
-        )
+        callbacks: list[BaseCallback] = [
+            EvalCallback(
+                eval_env,
+                n_eval_episodes=50,
+                eval_freq=5 * n_steps,
+                best_model_save_path=str(log_dir),
+                log_path=str(log_dir),
+                deterministic=True,
+                verbose=1,
+            ),
+        ]
+
+        if wandb_project is not None and WandbCallback is not None:
+            callbacks.append(WandbCallback(
+                model_save_path=str(log_dir),
+                verbose=1,
+            ))
 
         model.learn(
             total_timesteps=total_timesteps,
-            callback=callback,
+            callback=callbacks,
             tb_log_name=training_name,
             progress_bar=True,
         )
 
         model.save(log_dir / "final_model.zip")
+
+    if wandb_project is not None:
+        wandb.finish()
 
     return model, log_dir

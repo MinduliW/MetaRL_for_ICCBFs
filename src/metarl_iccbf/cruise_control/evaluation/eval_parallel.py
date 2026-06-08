@@ -1,7 +1,19 @@
 import os
+import sys
 import time
 import glob
 import numpy as np
+
+# Compatibility shim: models saved with numpy 2.x reference numpy._core,
+# which doesn't exist in numpy 1.x. Alias it to numpy.core so cloudpickle
+# can deserialize the model data.
+if not hasattr(np, "_core"):
+    import numpy.core as _numpy_core
+    np._core = _numpy_core
+    sys.modules.setdefault("numpy._core", _numpy_core)
+    sys.modules.setdefault("numpy._core.numeric", _numpy_core.numeric)
+    sys.modules.setdefault("numpy._core.multiarray", _numpy_core.multiarray)
+
 import multiprocessing as mp
 import queue as pyqueue
 from dataclasses import dataclass
@@ -16,8 +28,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-from stable_baselines3 import PPO
-from metarl_iccbf.cruise_control.envs.rlcbf_env import RLCBFcontrol
+# stable_baselines3 imports deferred to _init_worker()
 
 
 # ------------------- Globals in each worker -------------------
@@ -32,8 +43,32 @@ def _init_worker(progress_q, cfg):
     _PROGRESS_Q = progress_q
     _CFG = cfg
 
-    _MODEL = PPO.load(cfg.model_path, device="cpu")
-    _ENV = RLCBFcontrol(dt=cfg.dt, deterministic=True)
+    # Resolve env class
+    from stable_baselines3 import PPO
+    from sb3_contrib import RecurrentPPO
+
+    if cfg.env_type == "iccbf":
+        from metarl_iccbf.cruise_control.envs.rlcbf_env import RLCBFcontrol as EnvCls
+    elif cfg.env_type == "rl_only":
+        from metarl_iccbf.cruise_control.envs.rlonly_env import RLCBFcontrol as EnvCls
+    else:
+        raise ValueError(f"Unknown env_type: {cfg.env_type!r}")
+
+    # Resolve policy class
+    if cfg.algo == "sac":
+        from metarl_iccbf.recurrent_cleanrl.sac import RecurrentSAC
+        _MODEL = RecurrentSAC.load(cfg.model_path, device=cfg.device)
+    elif cfg.policy_type == "MAMBA":
+        from metarl_iccbf.recurrent_cleanrl.ppo import Mamba2PPO
+        _MODEL = Mamba2PPO.load(cfg.model_path, device=cfg.device)
+    elif cfg.policy_type in ("GRU", "LSTM"):
+        from metarl_iccbf.recurrent_cleanrl.ppo import RecurrentPPO as CleanRLRecurrentPPO
+        _MODEL = CleanRLRecurrentPPO.load(cfg.model_path, device=cfg.device)
+    elif cfg.policy_type == "RNN":
+        _MODEL = RecurrentPPO.load(cfg.model_path, device=cfg.device)
+    else:
+        _MODEL = PPO.load(cfg.model_path, device=cfg.device)
+    _ENV = EnvCls(dt=cfg.dt, deterministic=True)
 
 
 @dataclass
@@ -42,6 +77,10 @@ class EvalConfig:
     model_path: str
     dt: float = 0.1
     TOF: float = 40.0
+    policy_type: str = "MLP"
+    env_type: str = "iccbf"
+    algo: str = "ppo"  # "ppo" or "sac"
+    device: str = "cuda"  # "cuda" or "cpu"
 
     n_workers: int = 8
     n_chunks: int = 32
@@ -50,7 +89,7 @@ class EvalConfig:
 
     progress_update_every: int = 1
 
-    out_dir: str = "ResultsEval"
+    out_dir: str = "outputs/eval"
     out_mat: str = "NoiseMetaICCBFMargin_NN_fixedICs_parallel.mat"
 
 
@@ -91,11 +130,13 @@ def _evaluate_chunk(args: Tuple[np.ndarray, np.ndarray, str]) -> str:
 
         t = 0.0
         step = 0
+        episode_start = True
 
         while t <= cfg.TOF and step < lenvec:
             step += 1
 
-            action, _ = model.predict(obs, deterministic=cfg.deterministic_policy)
+            action, _ = model.predict(obs, deterministic=cfg.deterministic_policy, episode_start=episode_start)
+            episode_start = False  # Only first step of episode resets state
 
             t0 = time.perf_counter()
             obs, reward_temp, done, _, _ = env.step(action)

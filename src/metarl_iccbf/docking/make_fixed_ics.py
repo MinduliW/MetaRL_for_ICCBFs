@@ -77,7 +77,7 @@ def make_docking_episode_bank(
 
     if enforce_inner_safe:
         try:
-            from docking.Dockingcase import DockingCase
+            from metarl_iccbf.docking.Dockingcase import DockingCase
         except Exception as e:
             raise ImportError(
                 "enforce_inner_safe=True requires `Dockingcase.DockingCase` to be importable "

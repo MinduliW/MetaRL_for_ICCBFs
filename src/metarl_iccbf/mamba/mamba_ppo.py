@@ -9,7 +9,7 @@ RecurrentActorCriticPolicy)`` check (our policy inherits from
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import torch as th
 from gymnasium import spaces
@@ -23,7 +23,7 @@ from sb3_contrib.common.recurrent.buffers import (
 )
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
-from metarl_iccbf.mamba2.mamba_policy import Mamba2ActorCriticPolicy
+from metarl_iccbf.mamba.mamba_policy import Mamba2ActorCriticPolicy
 
 
 class Mamba2PPO(RecurrentPPO):
@@ -47,14 +47,14 @@ class Mamba2PPO(RecurrentPPO):
             else RecurrentRolloutBuffer
         )
 
-        self.policy = self.policy_class(
+        policy = self.policy_class(
             self.observation_space,
             self.action_space,
             self.lr_schedule,
             use_sde=self.use_sde,
             **self.policy_kwargs,
         )
-        self.policy = self.policy.to(self.device)
+        self.policy: Mamba2ActorCriticPolicy = cast(Mamba2ActorCriticPolicy, policy.to(self.device))
 
         # Read buffer dimensions from the fake LSTM attrs on the policy
         lstm = self.policy.lstm_actor

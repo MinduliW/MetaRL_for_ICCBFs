@@ -24,8 +24,8 @@ except Exception:
     RecurrentPPO = None
 
 # IMPORTANT: adjust import to your repo layout
-# If your docking env lives in docking/RLCBF.py, change to: from docking.RLCBF import RLCBFcontrol
-from docking.RLCBF import RLCBFcontrol
+# If your docking env lives in docking/RLCBF.py, change to: from .RLCBF import RLCBFcontrol
+from .RLCBF import RLCBFcontrol
 
 
 # ------------------- Globals in each worker -------------------
@@ -156,9 +156,9 @@ def _set_episode(env: RLCBFcontrol, spec: dict, i: int):
 
     # rebuild modules exactly like your reset does
     try:
-        from iccbfs import ICCBF
-        from Dockingcase import DockingCase
-        from dynamicsandControl import dynamicsAndControl
+        from metarl_iccbf.docking.iccbfs import ICCBF
+        from metarl_iccbf.docking.Dockingcase import DockingCase
+        from metarl_iccbf.docking.dynamicsandControl import dynamicsAndControl
     except Exception:
         # if imports fail due to package layout, the env likely already has these
         ICCBF = None

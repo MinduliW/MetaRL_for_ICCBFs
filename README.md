@@ -32,7 +32,7 @@ The result is **non-greedy, fuel-efficient, robust, and safe autonomy** for real
 
 ---
 
-## 🎥 Demos (Real rollouts)
+## Demos (Real rollouts)
 
 ### Cruise Control (Input-constrained safety)
 ![Demo](media/CCGif.gif)
@@ -72,17 +72,38 @@ This is my favourite test case. The first result has no ICCBF tuning and achieve
 ### Prerequisites
 
 - Python 3.11 or 3.12
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
-- NVIDIA GPU with CUDA 12.8 toolkit (for mamba-ssm / CUDA extensions)
-- `swig` (for box2d-py): `sudo apt install swig`
+- NVIDIA GPU with driver ≥ 520 (RTX 3090 / 4090 / A100 all work)
+- conda / miniconda **or** [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
-### Setup
+---
+
+### Option A — conda (recommended for workstations)
 
 ```bash
 # Clone the repository
 git clone https://github.com/<your-username>/MetaRL_for_ICCBFs.git
 cd MetaRL_for_ICCBFs
 
+# Create env, install all deps, build CUDA extensions from source
+bash setup_conda.sh
+
+# Activate
+conda activate metarl-iccbf
+```
+
+`setup_conda.sh` automatically:
+1. Creates a Python 3.11 env with `cuda-nvcc=12.8` (matches `torch+cu128`)
+2. Installs PyTorch from the official `whl/cu128` index
+3. Builds `causal-conv1d` and `mamba-ssm` **from source** against the installed torch (avoids pre-built wheel ABI mismatches)
+4. Installs all remaining project dependencies
+
+> **Note:** `mosek` is installed but requires a separate licence to run its solvers. `mujoco-py` is omitted — it is deprecated and not used.
+
+---
+
+### Option B — uv
+
+```bash
 # Install dependencies
 uv sync
 
@@ -93,17 +114,22 @@ uv sync --extra envs
 uv sync --extra dev
 ```
 
-### CUDA extensions (mamba-ssm)
-
-If mamba-ssm needs to build from source (no precompiled wheel available), set `CUDA_HOME` to your CUDA 12.8 toolkit:
+If mamba-ssm needs to build from source (no matching wheel), set `CUDA_HOME`:
 
 ```bash
 CUDA_HOME=/usr/local/cuda-12.8 uv sync
 ```
 
+---
+
 ### Verify installation
 
 ```bash
+# conda
+conda activate metarl-iccbf
+python -c "import metarl_iccbf; import mamba_ssm; import torch; print('All good')"
+
+# uv
 uv run python -c "import metarl_iccbf; import mamba_ssm; import torch; print('All good')"
 ```
 

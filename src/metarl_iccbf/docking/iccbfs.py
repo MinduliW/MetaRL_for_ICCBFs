@@ -134,6 +134,29 @@ class ICCBF:
 
         return float(np.sqrt(M1 * M1 + M2 * M2 + Mf34_tot * Mf34_tot + M5 * M5))
 
+    def delta_box_from_polys(self, f_polys, half_width):
+        """Compute the delta bound reusing pre-built dynamics polynomials."""
+        hw = np.asarray(half_width, dtype=float).flatten()
+        f1, f2, f3, f4, f5 = f_polys
+
+        def scale_all(p):
+            return (p.scaleVariable(1, float(hw[0]))
+                    .scaleVariable(2, float(hw[1]))
+                    .scaleVariable(3, float(hw[2]))
+                    .scaleVariable(4, float(hw[3]))
+                    .scaleVariable(5, float(hw[4])))
+
+        M1 = float(self.interval_maxabs(scale_all(f1).bound()))
+        M2 = float(self.interval_maxabs(scale_all(f2).bound()))
+        M3 = float(self.interval_maxabs(scale_all(f3).bound()))
+        M4 = float(self.interval_maxabs(scale_all(f4).bound()))
+        M5 = abs(float(self.om))
+
+        Mf34 = float(np.sqrt(M3 * M3 + M4 * M4))
+        Mf34_tot = Mf34 + abs(float(self.umax)) / abs(float(self.m))
+
+        return float(np.sqrt(M1 * M1 + M2 * M2 + Mf34_tot * Mf34_tot + M5 * M5))
+
     # -----------------------------
     # nu (your simplified Lemma-2)
     # -----------------------------
@@ -166,7 +189,7 @@ class ICCBF:
         l_h = self.lipschitz_bound_bounder_docking(h_poly, half_width)
         l_alpha = abs(float(hslack)) * l_h
 
-        Delta = self.delta_box_docking_bounder_L2(center=x0, half_width=half_width, da_order=4)
+        Delta = self.delta_box_from_polys(polys["f_polys"], half_width)
 
         u_max = abs(float(self.umax))
         l2 = l_Lfh + l_Lg_vec * u_max
@@ -268,6 +291,7 @@ class ICCBF:
                 "u1inf": u1inf,
                 "u2inf": u2inf,
                 "branch_info": {"Lgb1_1_x0": Lgb1_1_x0, "Lgb1_2_x0": Lgb1_2_x0},
+                "f_polys": (f1, f2, f3, f4, f5),
             }
 
         return Lgh1_val, Lgh2_val, Lfh_val, h_val

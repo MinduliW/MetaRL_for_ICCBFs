@@ -21,7 +21,7 @@ import warnings
 import multiprocessing
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Literal, Optional
 
 import numpy as np
 from torch.optim import Adam

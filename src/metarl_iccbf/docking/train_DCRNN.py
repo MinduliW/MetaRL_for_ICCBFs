@@ -28,7 +28,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback
 
-from RLCBF import RLCBFcontrol
+from .RLCBF import RLCBFcontrol
 
 # Optional: DA init for DA-based margins
 try:

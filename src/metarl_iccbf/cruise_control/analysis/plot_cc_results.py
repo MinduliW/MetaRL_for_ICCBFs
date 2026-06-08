@@ -220,17 +220,23 @@ def compute_total_thrust(M: Dict[str, Any], i: int, k_end: int, dt: float) -> fl
 # -----------------------------
 # Summary table (LaTeX)
 # -----------------------------
-def thrust_totals_table_latex(uTotals: np.ndarray, model_names: Sequence[str]) -> str:
+def thrust_totals_table_latex(
+    uTotals: np.ndarray,
+    model_names: Sequence[str],
+    safety_rates: Optional[Sequence[float]] = None,
+) -> str:
     """
-    Produce a compact LaTeX table string with mean/std/median/q25/q75/N.
+    Produce a compact LaTeX table string with mean/std/median/q25/q75/safety%/N.
     uTotals: shape (n_models, n_eps), may contain NaNs.
+    safety_rates: optional sequence of safety rates in [0, 100] (one per model).
     """
     rows = []
     for j, name in enumerate(model_names):
         x = np.asarray(uTotals[j, :], dtype=float)
         x = x[np.isfinite(x)]
+        sr = float(safety_rates[j]) if safety_rates is not None else float("nan")
         if x.size == 0:
-            rows.append((name, np.nan, np.nan, np.nan, np.nan, np.nan, 0))
+            rows.append((name, np.nan, np.nan, np.nan, np.nan, np.nan, sr, 0))
             continue
         rows.append((
             name,
@@ -239,20 +245,33 @@ def thrust_totals_table_latex(uTotals: np.ndarray, model_names: Sequence[str]) -
             float(np.median(x)),
             float(np.percentile(x, 25)),
             float(np.percentile(x, 75)),
+            sr,
             int(x.size),
         ))
 
     # Manual LaTeX (no pandas dependency)
     lines = []
-    lines.append(r"\begin{tabular}{lrrrrrr}")
-    lines.append(r"\hline")
-    lines.append(r"Method & Mean & Std & Median & Q1 & Q3 & $N$ \\")
-    lines.append(r"\hline")
-    for (name, mu, sd, med, q1, q3, n) in rows:
-        if n == 0:
-            lines.append(fr"{name} & -- & -- & -- & -- & -- & 0 \\")
-        else:
-            lines.append(fr"{name} & {mu:.4g} & {sd:.4g} & {med:.4g} & {q1:.4g} & {q3:.4g} & {n:d} \\")
+    if safety_rates is not None:
+        lines.append(r"\begin{tabular}{lrrrrrrl}")
+        lines.append(r"\hline")
+        lines.append(r"Method & Mean & Std & Median & Q1 & Q3 & Safety \% & $N$ \\")
+        lines.append(r"\hline")
+        for (name, mu, sd, med, q1, q3, sr, n) in rows:
+            sr_str = f"{sr:.1f}" if np.isfinite(sr) else "--"
+            if n == 0:
+                lines.append(fr"{name} & -- & -- & -- & -- & -- & {sr_str} & 0 \\")
+            else:
+                lines.append(fr"{name} & {mu:.4g} & {sd:.4g} & {med:.4g} & {q1:.4g} & {q3:.4g} & {sr_str} & {n:d} \\")
+    else:
+        lines.append(r"\begin{tabular}{lrrrrrr}")
+        lines.append(r"\hline")
+        lines.append(r"Method & Mean & Std & Median & Q1 & Q3 & $N$ \\")
+        lines.append(r"\hline")
+        for (name, mu, sd, med, q1, q3, _sr, n) in rows:
+            if n == 0:
+                lines.append(fr"{name} & -- & -- & -- & -- & -- & 0 \\")
+            else:
+                lines.append(fr"{name} & {mu:.4g} & {sd:.4g} & {med:.4g} & {q1:.4g} & {q3:.4g} & {n:d} \\")
     lines.append(r"\hline")
     lines.append(r"\end{tabular}")
     return "\n".join(lines)
@@ -266,6 +285,19 @@ def plot_cruisecontrol_threeway(
     mlp_mat: str,
     rnn_mat: str,
     model_names: Sequence[str] = ("ICCBF", "MLP-tuned ICCBF", "RNN-tuned ICCBF"),
+    **kwargs,
+) -> Dict[str, Any]:
+    """Legacy 3-model wrapper. Delegates to :func:`plot_cruisecontrol`."""
+    return plot_cruisecontrol(
+        mat_paths=[baseline_mat, mlp_mat, rnn_mat],
+        model_names=model_names,
+        **kwargs,
+    )
+
+
+def plot_cruisecontrol(
+    mat_paths: Sequence[str],
+    model_names: Optional[Sequence[str]] = None,
     stride_traj: int = 10,
     stride_ts: int = 2,
     sampling_mode: str = "linspace",  # "stride" or "linspace"
@@ -279,23 +311,41 @@ def plot_cruisecontrol_threeway(
     V_ylim: Tuple[float, float] = (0.0, 700.0),
     cmap_name: str = "turbo",
     save_prefix: Optional[str] = None,
+    skip_viability_filter: bool = False,
 ) -> Dict[str, Any]:
     """
-    Create the MATLAB-style cruise-control figure + violin plot + LaTeX table.
+    Create the MATLAB-style cruise-control figure + violin plot + LaTeX table
+    for an arbitrary number of models.
+
+    Parameters
+    ----------
+    mat_paths : sequence of str
+        Paths to .mat result files.  The first is treated as the baseline
+        (used for viability filtering).
+    model_names : sequence of str, optional
+        Display names for each model.  Defaults to ``("Model 0", "Model 1", ...)``.
+    skip_viability_filter : bool, optional
+        If True, skip the max-brake open-loop viability filter and treat all
+        episodes as viable.  Use this when impossible ICs have already been
+        removed from the episode bank (default: False).
 
     Returns
     -------
     out : dict
       Keys include:
-        - "models_sliced": list of dicts (baseline/mlp/rnn after viability filtering)
+        - "models_sliced": list of dicts after viability filtering
         - "viable_idx": indices kept
-        - "uTotals_full": (3, n_viable) array of total thrust
+        - "uTotals_full": (n_models, n_viable) array of total thrust
         - "latex_table": str
-        - "fig_main": matplotlib Figure (3x3)
+        - "fig_main": matplotlib Figure (3 x n_models)
         - "fig_violin": matplotlib Figure (violin)
     """
-    paths = [baseline_mat, mlp_mat, rnn_mat]
-    models = [load_mat(p) for p in paths]
+    n_models = len(mat_paths)
+    if model_names is None:
+        model_names = tuple(f"Model {i}" for i in range(n_models))
+    assert len(model_names) == n_models, "model_names length must match mat_paths"
+
+    models = [load_mat(p) for p in mat_paths]
 
     # --- viability filtering based on baseline ordering ---
     if "states" not in models[0]:
@@ -306,17 +356,24 @@ def plot_cruisecontrol_threeway(
         raise ValueError(f"Expected baseline states shape (N,Nt,2+). Got {states0.shape}")
 
     nEpisodes = states0.shape[0]
-    viable_mask = np.zeros((nEpisodes,), dtype=bool)
-    for i in range(nEpisodes):
-        x0 = states0[i, 0, 0:2]  # [d, v]
-        viable_mask[i] = simulate_max_brake(x0)
 
-    idx_keep = np.where(viable_mask)[0]
-    models_sliced = [slice_model_by_episode(M, idx_keep, nEpisodes) for M in models]
-    nEp_viable = int(np.asarray(models_sliced[0]["states"]).shape[0])
+    if skip_viability_filter:
+        idx_keep = np.arange(nEpisodes)
+        models_sliced = list(models)
+        nEp_viable = nEpisodes
+        print(f"Viability filter skipped. Using all {nEpisodes} episodes.")
+    else:
+        viable_mask = np.zeros((nEpisodes,), dtype=bool)
+        for i in range(nEpisodes):
+            x0 = states0[i, 0, 0:2]  # [d, v]
+            viable_mask[i] = simulate_max_brake(x0)
 
-    print(f"Total episodes: {nEpisodes}, viable episodes: {idx_keep.size}")
-    print(f"Viable episodes AFTER slicing: {nEp_viable}")
+        idx_keep = np.where(viable_mask)[0]
+        models_sliced = [slice_model_by_episode(M, idx_keep, nEpisodes) for M in models]
+        nEp_viable = int(np.asarray(models_sliced[0]["states"]).shape[0])
+
+        print(f"Total episodes: {nEpisodes}, viable episodes: {idx_keep.size}")
+        print(f"Viable episodes AFTER slicing: {nEp_viable}")
 
     # --- per-model preprocessing and global colour scaling (success-based robust percentiles) ---
     cmap = plt.get_cmap(cmap_name, 256)
@@ -402,16 +459,27 @@ def plot_cruisecontrol_threeway(
     linex = np.linspace(0.0, linex_max, 200)
     liney = linex / 1.8
 
-    # -----------------------------
-    # Main 3x3 figure
-    # -----------------------------
-    fig_main = plt.figure(figsize=(14, 10), facecolor="white")
-    axes = np.empty((3, 3), dtype=object)
+    # --------------------------------
+    # Paper-quality rcParams
+    # --------------------------------
+    plt.rcParams.update({
+        "font.size": 18,
+        "axes.titlesize": 18,
+        "axes.labelsize": 24,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
+        "legend.fontsize": 12,
+        "lines.linewidth": 0.7,
+    })
 
-    for j in range(3):
-        ax1 = fig_main.add_subplot(3, 3, j + 1)
-        ax2 = fig_main.add_subplot(3, 3, j + 4)
-        ax3 = fig_main.add_subplot(3, 3, j + 7)
+    # Main 3 x n_models figure
+    fig_main = plt.figure(figsize=(5.5 * n_models, 12), dpi=300, facecolor="white")
+    axes = np.empty((3, n_models), dtype=object)
+
+    for j in range(n_models):
+        ax1 = fig_main.add_subplot(3, n_models, j + 1)
+        ax2 = fig_main.add_subplot(3, n_models, j + 1 + n_models)
+        ax3 = fig_main.add_subplot(3, n_models, j + 1 + 2 * n_models)
         axes[:, j] = [ax1, ax2, ax3]
 
         P = per[j]
@@ -445,16 +513,10 @@ def plot_cruisecontrol_threeway(
 
         ax1.set_title(str(model_names[j]))
         ax1.set_xlabel("x [m]")
-        ax1.set_ylabel("v [m/s]")
+        if j == 0:
+            ax1.set_ylabel("v [m/s]")
         ax1.set_xlim(0, linex_max)
         ax1.set_ylim(0, v_max_plot)
-
-        # legend counts (full dataset)
-        nFail_full = int(np.sum(isFail))
-        nSucc_full = int(Ntraj - nFail_full)
-        hFailL, = ax1.plot([np.nan], [np.nan], "k--", linewidth=0.9)
-        hSuccL, = ax1.plot([np.nan], [np.nan], "k-", linewidth=0.7)
-        ax1.legend([hFailL, hSuccL], [f"Fail ({nFail_full})", f"Success ({nSucc_full})"], loc="best")
 
         # ---- Row 2: h(t) ----
         ax2.grid(True, alpha=0.25)
@@ -478,10 +540,9 @@ def plot_cruisecontrol_threeway(
                         ax2.plot(t[kf - 1], Hraw[ii, kf - 1], "o", markersize=3, color=col, markerfacecolor=col)
 
             ax2.axhline(0.0, color="k", linestyle="--", linewidth=0.9)
-            ax2.set_ylabel("h(t)")
-            ax2.set_ylim(*h_ylim)
             if j == 0:
-                ax2.set_xlabel("t [s]")
+                ax2.set_ylabel("h(t)")
+            ax2.set_ylim(*h_ylim)
 
         # ---- Row 3: V(t) ----
         ax3.grid(True, alpha=0.25)
@@ -499,7 +560,8 @@ def plot_cruisecontrol_threeway(
                 lw = 0.9 if bool(isFail[ii]) else 0.7
                 ax3.plot(t[tidx], Vraw[ii, tidx], linestyle=ls, linewidth=lw, color=col)
 
-            ax3.set_ylabel("V(t)")
+            if j == 0:
+                ax3.set_ylabel("V(t)")
             ax3.set_xlabel("t [s]")
             ax3.set_ylim(*V_ylim)
 
@@ -511,19 +573,20 @@ def plot_cruisecontrol_threeway(
     cax = fig_main.add_axes([0.25, 0.05, 0.50, 0.02])
     norm = plt.Normalize(vmin=umin, vmax=umax)
     cb = plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation="horizontal")
-    cb.set_label(r"Total thrust  $\int \|u\|\,dt$  (common scale)")
+    cb.set_label(r"Total thrust  $\int \|u\|\,dt$")
 
-    fig_main.tight_layout(rect=[0, 0.08, 1, 1])
+    fig_main.tight_layout(rect=[0, 0.06, 1, 1])
 
     if save_prefix:
-        fig_main.savefig(f"{save_prefix}_main.png", dpi=200, bbox_inches="tight")
+        fig_main.savefig(f"{save_prefix}_main.png", dpi=300, bbox_inches="tight")
 
     # -----------------------------
     # Violin plot + LaTeX table over ALL viable episodes
     # -----------------------------
-    uTotals_full = np.full((3, nEp_viable), np.nan, dtype=float)
+    uTotals_full = np.full((n_models, nEp_viable), np.nan, dtype=float)
+    safety_rates: List[float] = []
 
-    for j in range(3):
+    for j in range(n_models):
         M = models_sliced[j]
         X = np.asarray(M["states"])
         Ntraj, Nt, _ = X.shape
@@ -539,6 +602,10 @@ def plot_cruisecontrol_threeway(
                     isFail[i] = True
                     kFail[i] = int(neg[0] + 1)
 
+        n_safe = int(np.sum(~isFail))
+        safety_rates.append(100.0 * n_safe / Ntraj if Ntraj > 0 else 0.0)
+        print(f"  [{model_names[j]}] N_safe={n_safe}, N_MC={Ntraj}, safety={safety_rates[-1]:.1f}%")
+
         kStop = np.zeros((Ntraj,), dtype=int)
         for i in range(Ntraj):
             kStop[i] = compute_kstop(M, i, Nt, int(kFail[i]), bool(isFail[i]))
@@ -549,28 +616,29 @@ def plot_cruisecontrol_threeway(
 
         uTotals_full[j, :Ntraj] = u_all
 
-    fig_violin = plt.figure(figsize=(9, 3), facecolor="white")
+    fig_violin = plt.figure(figsize=(max(4, 2.5 * n_models), 3.5), dpi=300, facecolor="white")
     axv = fig_violin.add_subplot(1, 1, 1)
     axv.set_facecolor("white")
     axv.grid(True, alpha=0.25)
 
-    data = [uTotals_full[j, np.isfinite(uTotals_full[j, :])] for j in range(3)]
+    data = [uTotals_full[j, np.isfinite(uTotals_full[j, :])] for j in range(n_models)]
     parts = axv.violinplot(data, showmeans=True, showmedians=True, showextrema=True)
-    axv.set_xticks([1, 2, 3])
+    axv.set_xticks(range(1, n_models + 1))
     axv.set_xticklabels(list(model_names))
     axv.set_ylabel("Total thrust  ∫||u|| dt")
 
     fig_violin.tight_layout()
 
     if save_prefix:
-        fig_violin.savefig(f"{save_prefix}_violin.png", dpi=200, bbox_inches="tight")
+        fig_violin.savefig(f"{save_prefix}_violin.png", dpi=300, bbox_inches="tight")
 
-    latex_table = thrust_totals_table_latex(uTotals_full, model_names)
+    latex_table = thrust_totals_table_latex(uTotals_full, model_names, safety_rates=safety_rates)
 
     return dict(
         models_sliced=models_sliced,
         viable_idx=idx_keep,
         uTotals_full=uTotals_full,
+        safety_rates=safety_rates,
         latex_table=latex_table,
         fig_main=fig_main,
         fig_violin=fig_violin,

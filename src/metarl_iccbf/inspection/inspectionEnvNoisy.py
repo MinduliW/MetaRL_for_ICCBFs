@@ -6,40 +6,55 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import cvxpy as cp
-from pathlib import Path
 
-from inspection.iccbfs import ICCBF   # your sympy/symengine lambdified ICCBFs
-from inspection.iccbfda import ICCBFInspectionDA
-from inspection.dynamicsandControl import dynamicsAndControl
-from inspection.Observation import ObservationModel
+from metarl_iccbf.inspection.iccbfs import ICCBF
+from metarl_iccbf.inspection.iccbfda import ICCBFInspectionDA
+from metarl_iccbf.inspection.dynamicsandControl import dynamicsAndControl
+from metarl_iccbf.inspection.Observation import ObservationModel
 
 
 class InspectionEnv(gym.Env):
     # ================================================================
     # Init
     # ================================================================
-    def __init__(self, dt = 10.0, enable_param_randomisation = False,enableNoise = False, enableCBFtunning = False, dvWeight = 10.0):
+    def __init__(
+        self,
+        dt=10.0,
+        enable_param_randomisation=False,
+        enableNoise=False,
+        enableCBFtunning=False,
+        dvWeight=10.0,
+        adversarial: bool = False,
+        dv_budget_range: tuple = (0.5, 5.0),
+        morl: bool = False,
+        morl_coverage_threshold: float = 0.8,
+        morl_objective_set: str = "fuel",
+        fixed_ic: "np.ndarray | None" = None,
+    ):
+        if morl_objective_set not in ("fuel", "time"):
+            raise ValueError(
+                f"morl_objective_set must be 'fuel' or 'time', got {morl_objective_set!r}"
+            )
         # time
         self.tstepOriginal = float(dt)
         self.DT = float(dt)
         self.steps_done = 0
-        self.MAX_STEPS = 1224  # paper setup
+        self.cum_dv = 0.0
+        self.MAX_STEPS = 1224
 
 
         self.dvWeight = float(dvWeight)
- 
-        self.m = 12.0            # kg
-        self.mu = 3.986004418e14     # if CW uses km; dynamics class dictates actual units
-   
-        self.R_D = 5.0           # m
-        self.R_C = 10.0          # m
 
-        self.alpha_fov = np.deg2rad(60.0)   # rad (half-angle)
-        self.R_MAX = 800.0                  # m keep-in
-        self.V_MAX = 5.0                    # m/s (if used)
-        self.U_MAX = 1.0                    # N max thrust magnitude (L2 ball in your notes, per-axis sat in code)
+        self.m = 12.0  # kg
+        self.mu = 3.986004418e14  # if CW uses km; dynamics class dictates actual units
 
-   
+        self.R_D = 5.0  # m
+        self.R_C = 10.0  # m
+
+        self.alpha_fov = np.deg2rad(60.0)  # rad (half-angle)
+        self.R_MAX = 800.0  # m keep-in
+        self.V_MAX = 5.0  # m/s (if used)
+        self.U_MAX = 1.0  # N max thrust magnitude (L2 ball in your notes, per-axis sat in code)
 
         # inspection discretisation
         self.N_POINTS = 100
@@ -55,9 +70,9 @@ class InspectionEnv(gym.Env):
         self.base_R_MAX = float(self.R_MAX)
         self.base_U_MAX = float(self.U_MAX)
         self.base_r_orbit = float(6771.0e3)  # m
-        self.r = float(6771.0e3) 
-        
-        self.n = np.sqrt(self.mu / self.base_r_orbit ** 3)
+        self.r = float(6771.0e3)
+
+        self.n = np.sqrt(self.mu / self.base_r_orbit**3)
 
         # -------------------------
         # Episode parameter randomisation config
@@ -94,33 +109,31 @@ class InspectionEnv(gym.Env):
         # Noise settings
         # -------------------------
         self.enable_actuation_noise = enableNoise
-        self.sigma_u_mag = 0.05            # N
+        self.sigma_u_mag = 0.05  # N
         self.sigma_beta = np.deg2rad(0.1)  # rad
-        self.sigma_gamma = np.deg2rad(0.1) # rad
+        self.sigma_gamma = np.deg2rad(0.1)  # rad
 
         self.enable_state_meas_noise = enableNoise
-        self.sigma_pos = 0.1       # m
-        self.sigma_vel = 0.002     # m/s
-        self.sigma_theta_s = 0.0   # rad
+        self.sigma_pos = 0.1  # m
+        self.sigma_vel = 0.002  # m/s
+        self.sigma_theta_s = 0.0  # rad
 
         # -------------------------
         # Derived + models
-        
+
         self.enableCBFtunning = enableCBFtunning
-        
+
         self._rebuild_models()
-        
+
         self.iccbf_sym = ICCBF(
-        rho1=  self.base_R_D + self.base_R_C,               # inner boundary
-        rho2=float(self.R_MAX), # outer boundary
-        mu=self.mu,
-        n=self.n,
-        m=self.m,
-        alphaFOV=float(self.alpha_fov),
+            rho1=self.base_R_D + self.base_R_C,  # inner boundary
+            rho2=float(self.R_MAX),  # outer boundary
+            mu=self.mu,
+            n=self.n,
+            m=self.m,
+            alphaFOV=float(self.alpha_fov),
         )
         self.CBF1Vals, self.CBF2Vals, self.CBF3Vals = self.iccbf_sym.getICCBFs()
-        
-        
 
         # -------------------------
         # Initial distribution / cone params
@@ -132,7 +145,7 @@ class InspectionEnv(gym.Env):
         # -------------------------
         # Environment state
         # -------------------------
-        self.state = np.zeros(7, dtype=np.float64)          # [x,y,z,vx,vy,vz,theta_s]
+        self.state = np.zeros(7, dtype=np.float64)  # [x,y,z,vx,vy,vz,theta_s]
         self.inspected = np.zeros(self.N_POINTS, dtype=bool)
 
         # -------------------------
@@ -145,11 +158,11 @@ class InspectionEnv(gym.Env):
             dtype=np.float32,
         )
 
-        if  self.enableCBFtunning:
+        if self.enableCBFtunning:
             num_actions = 12  # [u_rl(3)] + [hslack1,hslack2,hslack3,a1,a2,b1,b2,c1,c2]
         else:
             num_actions = 3  # [u_rl(3)]
-            
+
         self.action_space = spaces.Box(
             low=-np.ones(num_actions, dtype=np.float32),
             high=np.ones(num_actions, dtype=np.float32),
@@ -159,30 +172,58 @@ class InspectionEnv(gym.Env):
         self.last_u_rl = np.zeros(3, dtype=np.float64)
         self.last_u_safe = np.zeros(3, dtype=np.float64)
 
+        # -------------------------
+        # MORL: vector reward mode
+        # -------------------------
+        self.morl = bool(morl)
+        self.morl_coverage_threshold = float(morl_coverage_threshold)
+        self.morl_objective_set = str(morl_objective_set)
+        if self.morl:
+            self.reward_space = spaces.Box(
+                low=np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32),
+                high=np.array([np.inf, np.inf, np.inf], dtype=np.float32),
+                shape=(3,),
+                dtype=np.float32,
+            )
+
+        # Optional pinned initial state (skips IC sampling + sun rejection in reset).
+        # Shape (7,): [x, y, z, vx, vy, vz, theta_s]. Validated lazily on first reset
+        # using the active barrier params (KOZ, KIZ, sun).
+        self.fixed_ic = None if fixed_ic is None else np.asarray(fixed_ic, dtype=np.float64).copy()
+
+        # -------------------------
+        # Adversarial chief
+        # -------------------------
+        self.adversarial = bool(adversarial)
+        self.dv_budget_range = (float(dv_budget_range[0]), float(dv_budget_range[1]))
+        self.dv_budget = 0.0
+        self.dv_per_step = 0.0
+        self.dv_remaining = 0.0
+
+        # Build parametric QP once (re-solved with updated params each step)
+        self._build_qp()
 
     def _rebuild_models(self):
         KOZ = float(self.R_C + self.R_D)
 
         self.iccbf_da = ICCBFInspectionDA(
-                mu=self.mu,
-                n=self.n,
-                m=self.m,
-                rho_koz=KOZ,
-                rho_kiz=self.R_MAX,
-                alpha_fov=self.alpha_fov,
-                u_max_axis=self.U_MAX,
-            )
-  
+            mu=self.mu,
+            n=self.n,
+            m=self.m,
+            rho_koz=KOZ,
+            rho_kiz=self.R_MAX,
+            alpha_fov=self.alpha_fov,
+            u_max_axis=self.U_MAX,
+        )
 
         self.dynamics = dynamicsAndControl(mu=self.mu, n=self.n, rc=self.R_C, m=self.m)
 
-    
         self.obs_model = ObservationModel.from_spherical_chief(
             radius=self.R_C,
             n_points=self.N_POINTS,
             base_rgb_value=1.0,
         )
-        
+
         # self.iccbf_sym = ICCBF(
         # rho1=KOZ,               # inner boundary
         # rho2=float(self.R_MAX), # outer boundary
@@ -191,8 +232,81 @@ class InspectionEnv(gym.Env):
         # m=self.m,
         # alphaFOV=float(self.alpha_fov),
         # )
-      
-            
+
+    def _build_qp(self):
+        """Build the parametric ICCBF-QP once; only .value updates per step."""
+        # Decision variables
+        self._qp_u = cp.Variable(3)
+        self._qp_k = cp.Variable(nonneg=True)
+        self._qp_delta = cp.Variable(nonneg=True)
+        self._qp_gamma = cp.Variable(nonneg=True)
+
+        # Parameters (updated each step before solve)
+        self._qp_u_rl = cp.Parameter(3)
+
+        # Constraint 1 (KOZ)
+        self._qp_h1 = cp.Parameter()
+        self._qp_Lf1h = cp.Parameter()
+        self._qp_Lg1h1 = cp.Parameter()
+        self._qp_Lg1h2 = cp.Parameter()
+        self._qp_Lg1h3 = cp.Parameter()
+        self._qp_rhs1 = cp.Parameter()  # precomputed: -hSlack1*h1 + nu1
+
+        # Constraint 2 (KIZ)
+        self._qp_h2 = cp.Parameter()
+        self._qp_Lf2h = cp.Parameter()
+        self._qp_Lg2h1 = cp.Parameter()
+        self._qp_Lg2h2 = cp.Parameter()
+        self._qp_Lg2h3 = cp.Parameter()
+        self._qp_rhs2 = cp.Parameter()  # precomputed: -hSlack2*h2 + nu2
+
+        # Constraint 3 (Sun)
+        self._qp_h3 = cp.Parameter()
+        self._qp_Lf3h = cp.Parameter()
+        self._qp_Lg3h1 = cp.Parameter()
+        self._qp_Lg3h2 = cp.Parameter()
+        self._qp_Lg3h3 = cp.Parameter()
+        self._qp_rhs3 = cp.Parameter()  # precomputed: -hSlack3*h3 + nu3
+
+        # Objective: 10*k + 10*delta + 10*gamma + 0.01*||u - u_rl||^2
+        _cost = (
+            10.0 * self._qp_k
+            + 10.0 * self._qp_delta
+            + 10.0 * self._qp_gamma
+            + 1e-2 * cp.sum_squares(self._qp_u - self._qp_u_rl)
+        )
+
+        # Constraints (rearranged for DCP: moved slack*h to LHS)
+        #   Lf + Lg*u + slack_var*h >= rhs   where rhs = -hSlack*h + nu
+        _constraints = [
+            (
+                self._qp_Lf1h
+                + self._qp_Lg1h1 * self._qp_u[0]
+                + self._qp_Lg1h2 * self._qp_u[1]
+                + self._qp_Lg1h3 * self._qp_u[2]
+                + self._qp_k * self._qp_h1
+                >= self._qp_rhs1
+            ),
+            (
+                self._qp_Lf2h
+                + self._qp_Lg2h1 * self._qp_u[0]
+                + self._qp_Lg2h2 * self._qp_u[1]
+                + self._qp_Lg2h3 * self._qp_u[2]
+                + self._qp_delta * self._qp_h2
+                >= self._qp_rhs2
+            ),
+            (
+                self._qp_Lf3h
+                + self._qp_Lg3h1 * self._qp_u[0]
+                + self._qp_Lg3h2 * self._qp_u[1]
+                + self._qp_Lg3h3 * self._qp_u[2]
+                + self._qp_gamma * self._qp_h3
+                >= self._qp_rhs3
+            ),
+        ]
+
+        self._qp_problem = cp.Problem(cp.Minimize(_cost), _constraints)
+
     def _sample_episode_params(self, rng: np.random.Generator) -> dict:
         return {k: float(rng.uniform(self.pmin[k], self.pmax[k])) for k in self.pmin.keys()}
 
@@ -207,7 +321,9 @@ class InspectionEnv(gym.Env):
         return out
 
     def _apply_execution_noise(self, u_cmd: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        u_cmd = np.asarray(u_cmd, dtype=float).reshape(3,)
+        u_cmd = np.asarray(u_cmd, dtype=float).reshape(
+            3,
+        )
         u_cmd = self._sat_axis(u_cmd, self.U_MAX)
 
         if not self.enable_actuation_noise:
@@ -235,7 +351,6 @@ class InspectionEnv(gym.Env):
         u_exec = np.array([u_kE * cB * sG, u_kE * cB * cG, u_kE * sB], dtype=float)
         return self._sat_axis(u_exec, self.U_MAX)
 
-
     def _sym_u_inf_from_Lgb1(self, cbf_vals, state_vars, u_max: float):
         """
         Replicate DA branching:
@@ -252,7 +367,6 @@ class InspectionEnv(gym.Env):
         u3inf = (-umax) if (Lgb1_3 > 0.0) else (umax)
         return np.array([u1inf, u2inf, u3inf], dtype=float)
 
-
     def _sym_eval_b2_terms(self, cbf_vals, *, x6, gains, u_max, rsun_unit=None):
         """
         Returns (h, Lf, Lg1, Lg2, Lg3) where h is b2(x0) (ICCBF layer-2 value),
@@ -260,7 +374,9 @@ class InspectionEnv(gym.Env):
 
         Critically: chooses u_inf using the sign of Lg b1 at x0 (DA-consistent).
         """
-        x6 = np.asarray(x6, dtype=float).reshape(6,)
+        x6 = np.asarray(x6, dtype=float).reshape(
+            6,
+        )
         x1, x2, x3, x4, x5, x6v = map(float, x6.tolist())
 
         # gains = (a1,a2,b1,b2,c1,c2) in YOUR env convention
@@ -269,16 +385,57 @@ class InspectionEnv(gym.Env):
         if rsun_unit is None:
             # matches iccbfs.py for CBF1/CBF2:
             # state_vars = [x1..x6, acoef1,acoef2,bcoef1,bcoef2,ccoef1,ccoef2]
-            state_vars = [x1, x2, x3, x4, x5, x6v, a1, a2, b1, b2, c1, c2, self.m, self.R_C, self.R_D, self.r, self.R_MAX]
+            state_vars = [
+                x1,
+                x2,
+                x3,
+                x4,
+                x5,
+                x6v,
+                a1,
+                a2,
+                b1,
+                b2,
+                c1,
+                c2,
+                self.m,
+                self.R_C,
+                self.R_D,
+                self.r,
+                self.R_MAX,
+            ]
         else:
-            rs = np.asarray(rsun_unit, dtype=float).reshape(3,)
+            rs = np.asarray(rsun_unit, dtype=float).reshape(
+                3,
+            )
             rsn = float(np.linalg.norm(rs))
             rs = (rs / rsn) if rsn > 1e-12 else np.array([1.0, 0.0, 0.0], dtype=float)
             rs1, rs2, rs3 = map(float, rs.tolist())
 
             # matches iccbfs.py for CBF3:
             # state_vars = [x1..x6, rs1,rs2,rs3, acoef1,acoef2,bcoef1,bcoef2,ccoef1,ccoef2]
-            state_vars = [x1, x2, x3, x4, x5, x6v, rs1, rs2, rs3, a1, a2, b1, b2, c1, c2, self.m, self.R_C, self.R_D, self.r, self.R_MAX]
+            state_vars = [
+                x1,
+                x2,
+                x3,
+                x4,
+                x5,
+                x6v,
+                rs1,
+                rs2,
+                rs3,
+                a1,
+                a2,
+                b1,
+                b2,
+                c1,
+                c2,
+                self.m,
+                self.R_C,
+                self.R_D,
+                self.r,
+                self.R_MAX,
+            ]
 
         # --- DA-consistent branching for u_inf using SymPy Lg(b1) signs ---
         u_inf = self._sym_u_inf_from_Lgb1(cbf_vals, state_vars, u_max=u_max)
@@ -287,14 +444,13 @@ class InspectionEnv(gym.Env):
         all_vars = list(state_vars) + [u1inf, u2inf, u3inf]
 
         # b2-level terms (these are what your DA code returns as vals)
-        h_b2  = float(cbf_vals.b2_func(*all_vars))
+        h_b2 = float(cbf_vals.b2_func(*all_vars))
         Lf_b2 = float(cbf_vals.Lfb2_func(*all_vars))
-        Lg1   = float(cbf_vals.Lgb2_1_func(*all_vars))
-        Lg2   = float(cbf_vals.Lgb2_2_func(*all_vars))
-        Lg3   = float(cbf_vals.Lgb2_3_func(*all_vars))
+        Lg1 = float(cbf_vals.Lgb2_1_func(*all_vars))
+        Lg2 = float(cbf_vals.Lgb2_2_func(*all_vars))
+        Lg3 = float(cbf_vals.Lgb2_3_func(*all_vars))
 
         return h_b2, Lf_b2, Lg1, Lg2, Lg3, u_inf
-
 
     def _noisy_measurement_state(self, x_true: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         x = np.asarray(x_true, dtype=float).copy()
@@ -306,30 +462,76 @@ class InspectionEnv(gym.Env):
         x[6] = float(np.mod(x[6], 2.0 * np.pi))
         return x
 
-    def _sample_initial_state(self, rng: np.random.Generator) -> np.ndarray:
-        r0_mag = float(rng.uniform(self.INIT_RANGE_MIN, self.INIT_RANGE_MAX))
-        az = float(rng.uniform(0.0, 2.0 * np.pi))
-        el = float(rng.uniform(-0.5 * np.pi, 0.5 * np.pi))
+    def _sample_initial_state(self, rng: np.random.Generator, max_attempts: int = 50) -> np.ndarray:
+        _BARRIER_MARGIN = 0.01
 
-        r0 = np.array([
-            r0_mag * np.cos(el) * np.cos(az),
-            r0_mag * np.cos(el) * np.sin(az),
-            r0_mag * np.sin(el),
-        ], dtype=float)
+        if self.fixed_ic is not None:
+            state = self.fixed_ic.copy()
+            h_koz, h_kiz, h_sun = self._evaluate_base_barriers(state)
+            if not (h_koz > _BARRIER_MARGIN and h_kiz > _BARRIER_MARGIN and h_sun > _BARRIER_MARGIN):
+                raise ValueError(
+                    f"fixed_ic violates base barriers under current params: "
+                    f"h_koz={h_koz:.4f}, h_kiz={h_kiz:.4f}, h_sun={h_sun:.4f}"
+                )
+            return state
 
-        v0 = np.zeros(3, dtype=float)
-        theta_s0 = float(rng.uniform(0.0, 2.0 * np.pi))
+        for _ in range(max_attempts):
+            r0_mag = float(rng.uniform(self.INIT_RANGE_MIN, self.INIT_RANGE_MAX))
+            az = float(rng.uniform(0.0, 2.0 * np.pi))
+            el = float(rng.uniform(-0.5 * np.pi, 0.5 * np.pi))
 
-        sun_dir =  self.obs_model.sun_direction(theta_s0)
-        r_norm = float(np.linalg.norm(r0))
-        boresight = -r0 / r_norm  # deputy -> chief
+            r0 = np.array(
+                [
+                    r0_mag * np.cos(el) * np.cos(az),
+                    r0_mag * np.cos(el) * np.sin(az),
+                    r0_mag * np.sin(el),
+                ],
+                dtype=float,
+            )
 
-        cos_theta_b = float(np.clip(boresight.dot(sun_dir), -1.0, 1.0))
+            v0 = np.zeros(3, dtype=float)
+            theta_s0 = float(rng.uniform(0.0, 2.0 * np.pi))
+
+            sun_dir = self.obs_model.sun_direction(theta_s0)
+            r_norm = float(np.linalg.norm(r0))
+            boresight = -r0 / r_norm  # deputy -> chief
+
+            cos_theta_b = float(np.clip(boresight.dot(sun_dir), -1.0, 1.0))
+            theta_b = float(np.arccos(cos_theta_b))
+            if theta_b < np.deg2rad(self.THETA_B_MIN_DEG):
+                r0 = -r0
+
+            state = np.concatenate([r0, v0, [theta_s0]]).astype(np.float64)
+
+            h_koz, h_kiz, h_sun = self._evaluate_base_barriers(state)
+            if h_koz > _BARRIER_MARGIN and h_kiz > _BARRIER_MARGIN and h_sun > _BARRIER_MARGIN:
+                return state
+
+        return state  # fallback (should almost never reach here)
+
+    def _evaluate_base_barriers(self, state: np.ndarray):
+        """Evaluate the three base-level barrier functions at a given state.
+        Returns (h_koz, h_kiz, h_sun).
+        """
+        pos = state[:3]
+        r_sq = float(np.dot(pos, pos))
+
+        rho_koz = float(self.R_C + self.R_D)
+        rho_kiz = float(self.R_MAX)
+        alpha = 1.0 / max(1e-12, rho_kiz**2 - rho_koz**2)
+
+        h_koz = alpha * (r_sq - rho_koz**2)
+        h_kiz = alpha * (rho_kiz**2 - r_sq)
+
+        theta_s = float(state[6])
+        sun_dir = self.obs_model.sun_direction(theta_s)
+        r_norm = float(np.sqrt(max(r_sq, 1e-24)))
+        boresight = -pos / r_norm
+        cos_theta_b = float(np.clip(np.dot(boresight, sun_dir), -1.0, 1.0))
         theta_b = float(np.arccos(cos_theta_b))
-        if theta_b < np.deg2rad(self.THETA_B_MIN_DEG):
-            r0 = -r0
+        h_sun = theta_b - self.alpha_fov / 2.0
 
-        return np.concatenate([r0, v0, [theta_s0]]).astype(np.float64)
+        return h_koz, h_kiz, h_sun
 
     def _largest_cluster_direction(self) -> np.ndarray:
         unins_mask = ~self.inspected
@@ -369,13 +571,13 @@ class InspectionEnv(gym.Env):
         x, y, z, vx, vy, vz, theta_s = map(float, x_meas)
 
         # counts + cluster direction
-        P_i = float(self.inspected.sum())                 # [0, N_POINTS]
-        P_c = self._largest_cluster_direction()           # nominally unit
+        P_i = float(self.inspected.sum())  # [0, N_POINTS]
+        P_c = self._largest_cluster_direction()  # nominally unit
         P_cx, P_cy, P_cz = map(float, P_c.tolist())
 
         # scales (no extra helpers)
-        posS = float(800.0)                          # metres
-        velS = float(10.0) 
+        posS = float(800.0)  # metres
+        velS = float(10.0)
 
         # angle -> [-1,1] (no clip)
         theta_s = float(np.mod(theta_s, 2.0 * np.pi))
@@ -386,17 +588,23 @@ class InspectionEnv(gym.Env):
 
         return np.array(
             [
-                x / posS, y / posS, z / posS,
-                vx / velS, vy / velS, vz / velS,
-                thetaN, PiN,
-                P_cx, P_cy, P_cz,
+                x / posS,
+                y / posS,
+                z / posS,
+                vx / velS,
+                vy / velS,
+                vz / velS,
+                thetaN,
+                PiN,
+                P_cx,
+                P_cy,
+                P_cz,
             ],
             dtype=np.float32,
         )
 
-   
     def reset(self, *, seed=None, options=None):
-  
+
         super().reset(seed=seed)
         rng = self.np_random
 
@@ -412,7 +620,7 @@ class InspectionEnv(gym.Env):
             self.U_MAX = float(p["U_MAX"])
             self.R_MAX = float(p["R_MAX"])
             self.r = float(p["r"])
-            self.n = float(np.sqrt(self.mu / self.r ** 3))
+            self.n = float(np.sqrt(self.mu / self.r**3))
 
             self._rebuild_models()
 
@@ -422,9 +630,23 @@ class InspectionEnv(gym.Env):
         self.state = self._sample_initial_state(rng)
 
         # ------------------------------------------------------------
+        # 2b) Sample adversarial budget (hidden from agent)
+        # ------------------------------------------------------------
+        if self.adversarial:
+            self.dv_budget = float(rng.uniform(*self.dv_budget_range))
+            self.dv_per_step = self.dv_budget / float(self.MAX_STEPS)
+            self.dv_remaining = self.dv_budget
+        else:
+            self.dv_budget = 0.0
+            self.dv_per_step = 0.0
+            self.dv_remaining = 0.0
+
+        # ------------------------------------------------------------
         # 3) Reset inspection state + initial visibility
         # ------------------------------------------------------------
         self.steps_done = 0
+        self.cum_dv = 0.0
+        self.cum_impulse = 0.0
         self.inspected = np.zeros(self.N_POINTS, dtype=bool)
 
         obs_dict = self.obs_model.get_observation(self._noisy_measurement_state(self.state, rng))
@@ -463,14 +685,18 @@ class InspectionEnv(gym.Env):
         # -------------------------
         # 1) Margins from DA (keep)
         # -------------------------
-        nu1, _ = self.iccbf_da.getmargin_koz(x6, k1=a1, k2=a2, hslack=hslack1, tstep=T, half_width6=half_width6)
-        nu2, _ = self.iccbf_da.getmargin_kiz(x6, k1=b1, k2=b2, hslack=hslack2, tstep=T, half_width6=half_width6)
+        nu1, _ = self.iccbf_da.getmargin_koz(
+            x6, k1=a1, k2=a2, hslack=hslack1, tstep=T, half_width6=half_width6
+        )
+        nu2, _ = self.iccbf_da.getmargin_kiz(
+            x6, k1=b1, k2=b2, hslack=hslack2, tstep=T, half_width6=half_width6
+        )
 
-        rsun =  self.obs_model.sun_direction(self.state[6])
+        rsun = self.obs_model.sun_direction(self.state[6])
         rsun = np.asarray(rsun, dtype=float)
         rsn = float(np.linalg.norm(rsun))
-        rsun_unit = (rsun / rsn)
-        
+        rsun_unit = rsun / rsn
+
         nu3, _ = self.iccbf_da.getmargin_sun(
             x6, k1=c1, k2=c2, hslack=hslack3, tstep=T, half_width6=half_width6, rsun_unit=rsun_unit
         )
@@ -495,15 +721,31 @@ class InspectionEnv(gym.Env):
         # 3) Solve QP (unchanged)
         # -------------------------
         uOpt, isSolved = self.qp_optimizationICCBF(
-            u_rl, 
-            h1, Lfh1, Lgh1_1, Lgh1_2, Lgh1_3,
-            h2, Lfh2, Lgh2_1, Lgh2_2, Lgh2_3,
-            h3, Lfh3, Lgh3_1, Lgh3_2, Lgh3_3,
-            self.state, hslack1, hslack2, hslack3, nu1, nu2, nu3
+            u_rl,
+            h1,
+            Lfh1,
+            Lgh1_1,
+            Lgh1_2,
+            Lgh1_3,
+            h2,
+            Lfh2,
+            Lgh2_1,
+            Lgh2_2,
+            Lgh2_3,
+            h3,
+            Lfh3,
+            Lgh3_1,
+            Lgh3_2,
+            Lgh3_3,
+            self.state,
+            hslack1,
+            hslack2,
+            hslack3,
+            nu1,
+            nu2,
+            nu3,
         )
-        return uOpt, isSolved
-
-
+        return uOpt, isSolved, h1, h2, h3
 
     # ================================================================
     # Step
@@ -528,26 +770,40 @@ class InspectionEnv(gym.Env):
             c1 = (action[idx + 7] + 1.0) / 2.0
             c2 = (action[idx + 8] + 1.0) / 2.0
         else:
-            
             hslack1 = 0.05
             hslack2 = 0.05
             hslack3 = 0.05
-            a1= 0.05
-            a2= 0.05
-            b1= 0.05
-            b2= 0.05
-            c1= 0.05
-            c2= 0.05
+            a1 = 0.05
+            a2 = 0.05
+            b1 = 0.05
+            b2 = 0.05
+            c1 = 0.05
+            c2 = 0.05
 
         # 3) Safety filter (ICCBF-QP)
-        u_safe, solved = self.getControl(
-            hslack1=hslack1, hslack2=hslack2, hslack3=hslack3,
-            a1=a1, a2=a2, b1=b1, b2=b2, c1=c1, c2=c2,
-            u_rl=u_rl
+        u_safe, solved, h1, h2, h3 = self.getControl(
+            hslack1=hslack1,
+            hslack2=hslack2,
+            hslack3=hslack3,
+            a1=a1,
+            a2=a2,
+            b1=b1,
+            b2=b2,
+            c1=c1,
+            c2=c2,
+            u_rl=u_rl,
         )
 
         if (not solved) or (u_safe is None):
+            print(
+                f"QP FAILED | step={self.steps_done} "
+                f"| h1(KOZ)={h1:.4f} h2(KIZ)={h2:.4f} h3(sun)={h3:.4f} "
+                f"| r={np.linalg.norm(self.state[:3]):.1f}m "
+                f"| |u_rl|={np.linalg.norm(u_rl):.4f}"
+            )
             u_safe = u_rl.copy()
+        min_h = float(min(h1, h2, h3))
+        self.last_min_h = min_h
 
         u_safe = self._sat_axis(u_safe, self.U_MAX)
 
@@ -560,6 +816,16 @@ class InspectionEnv(gym.Env):
 
         # 5) Propagate
         self.state = self.dynamics.propwithCW(self.state, u_exec, self.DT)
+
+        # 5b) Passive adversarial chief: velocity impulse away from deputy
+        if self.adversarial and self.dv_remaining > 1e-9:
+            r = self.state[:3]
+            r_norm = float(np.linalg.norm(r))
+            if r_norm > 1e-9:
+                dv_k = min(self.dv_per_step, self.dv_remaining)
+                self.state[3:6] += dv_k * (r / r_norm)
+                self.dv_remaining -= dv_k
+
         self.steps_done += 1
 
         # 6) Update inspection
@@ -573,27 +839,33 @@ class InspectionEnv(gym.Env):
 
         # self.dvWeight = 500.0
         # 7) Reward (simple)
-        reward = 0.1 * float(num_new)
+        coverage_reward = 0.1 * float(num_new)
         dV_proxy = np.linalg.norm(u_safe) / self.m * self.DT
-        
-        reward -=  self.dvWeight * dV_proxy
+        self.cum_dv += float(dV_proxy)  # true ΔV in m/s
+        self.cum_impulse = getattr(self, "cum_impulse", 0.0) + float(np.linalg.norm(u_safe) * self.DT)  # N·s, matches eval_parallel uTotal
+        fuel_cost = self.dvWeight * dV_proxy
+
+        reward = coverage_reward - fuel_cost
 
         # 8) Termination checks (hard checks)
         pos = self.state[:3]
         r_norm = float(np.linalg.norm(pos))
         terminated = False
         truncated = False
+        safety_penalty = 0.0
 
         # KOZ / KIZ
         if r_norm <= float(self.R_C + self.R_D):
             terminated = True
+            safety_penalty += 1.0
             reward -= 1.0
         if r_norm > float(self.R_MAX):
             terminated = True
+            safety_penalty += 1.0
             reward -= 1.0
 
         # Sun-avoidance hard check
-        rs =  self.obs_model.sun_direction(self.state[6])
+        rs = self.obs_model.sun_direction(self.state[6])
         rs = np.asarray(rs, dtype=float)
         rsn = np.linalg.norm(rs)
         rs = (rs / rsn) if rsn > 1e-12 else np.array([1.0, 0.0, 0.0])
@@ -603,6 +875,7 @@ class InspectionEnv(gym.Env):
         h_sun = float(np.cos(self.alpha_fov / 2.0) - cos_theta_b)
         if h_sun < 0.0:
             terminated = True
+            safety_penalty += 1.0
             reward -= 1.0
 
         # task completion
@@ -621,7 +894,44 @@ class InspectionEnv(gym.Env):
             "u_rl": self.last_u_rl.copy(),
             "u_safe": self.last_u_safe.copy(),
             "qp_solved": bool(solved),
+            "dv_budget": float(self.dv_budget),
+            "dv_remaining": float(self.dv_remaining),
+            "cum_dv": float(self.cum_dv),           # true ΔV in m/s
+            "cum_impulse": float(getattr(self, "cum_impulse", 0.0)),  # N·s, matches eval_parallel uTotal
         }
+
+        if self.morl:
+            # Normalize fuel cost to [-1, 0] to match min_h's [0, 1] range,
+            # preventing the ~20-40x scale gap that collapses the Pareto surface.
+            max_fuel_per_step = self.dvWeight * self.U_MAX / self.m * self.DT
+            fuel_cost_norm = fuel_cost / max_fuel_per_step if max_fuel_per_step > 0 else fuel_cost
+
+            # Per-step potential: reward angular alignment with uninspected cluster.
+            # cos_angle > 0 when spacecraft is in the same hemisphere as the cluster,
+            # incentivising orbital manoeuvring without pulling radially into the KOZ.
+            cluster_dir = self._largest_cluster_direction()
+            pos_hat = pos / max(r_norm, 1e-12)
+            cos_angle = float(np.dot(pos_hat, cluster_dir))
+            coverage_reward += 0.01 * max(cos_angle, 0.0)
+
+            if self.morl_objective_set == "time":
+                # Per-step time penalty: cumulative ∈ [-1, 0]. Conflicts with coverage
+                # because passive natural-motion orbits inspect for free but slowly.
+                second_obj = -1.0 / float(self.MAX_STEPS)
+            else:
+                second_obj = -fuel_cost_norm
+
+            # Safety axis is 0 per step — QP filter enforces hard safety continuously.
+            # Terminal violation fires -60 on the safety axis (weighted by w_safety,
+            # typically 0.2, giving -12 scalarized — exceeds one episode's max coverage).
+            r_vec = np.array(
+                [coverage_reward, second_obj, 0.0],
+                dtype=np.float32,
+            )
+            if terminated and safety_penalty > 0:
+                r_vec[2] -= 100.0
+            return obs, r_vec, terminated, truncated, info
+
         return obs, reward, terminated, truncated, info
 
     # ================================================================
@@ -630,33 +940,71 @@ class InspectionEnv(gym.Env):
     def qp_optimizationICCBF(
         self,
         u_rl,
-        h1, Lf1h, Lg1h1, Lg1h2, Lg1h3,
-        h2, Lf2h, Lg2h1, Lg2h2, Lg2h3,
-        h3, Lf3h, Lg3h1, Lg3h2, Lg3h3,
-        x, hSlack1, hSlack2, hSlack3, nu1, nu2, nu3
+        h1,
+        Lf1h,
+        Lg1h1,
+        Lg1h2,
+        Lg1h3,
+        h2,
+        Lf2h,
+        Lg2h1,
+        Lg2h2,
+        Lg2h3,
+        h3,
+        Lf3h,
+        Lg3h1,
+        Lg3h2,
+        Lg3h3,
+        x,
+        hSlack1,
+        hSlack2,
+        hSlack3,
+        nu1,
+        nu2,
+        nu3,
     ):
-        u = cp.Variable(3)
-        k = cp.Variable(nonneg=True)
-        delta = cp.Variable(nonneg=True)
-        gamma = cp.Variable(nonneg=True)
+        # Update parameter values (no Problem rebuild)
+        self._qp_u_rl.value = np.asarray(u_rl, dtype=float).reshape(
+            3,
+        )
 
-        cost = 10.0 * k + 10.0 * delta + 10.0 * gamma + 1e-2 * cp.sum_squares(u - u_rl)
+        self._qp_h1.value = float(h1)
+        self._qp_Lf1h.value = float(Lf1h)
+        self._qp_Lg1h1.value = float(Lg1h1)
+        self._qp_Lg1h2.value = float(Lg1h2)
+        self._qp_Lg1h3.value = float(Lg1h3)
+        self._qp_rhs1.value = float(-hSlack1 * h1 + nu1)
 
-        constraints = [
-            Lf1h + Lg1h1*u[0] + Lg1h2*u[1] + Lg1h3*u[2] >= -(hSlack1 + k) * h1 + nu1,
-            Lf2h + Lg2h1*u[0] + Lg2h2*u[1] + Lg2h3*u[2] >= -(hSlack2 + delta) * h2 + nu2,
-            Lf3h + Lg3h1*u[0] + Lg3h2*u[1] + Lg3h3*u[2] >= -(hSlack3 + gamma) * h3 + nu3,
-        ]
+        self._qp_h2.value = float(h2)
+        self._qp_Lf2h.value = float(Lf2h)
+        self._qp_Lg2h1.value = float(Lg2h1)
+        self._qp_Lg2h2.value = float(Lg2h2)
+        self._qp_Lg2h3.value = float(Lg2h3)
+        self._qp_rhs2.value = float(-hSlack2 * h2 + nu2)
 
-        problem = cp.Problem(cp.Minimize(cost), constraints)
+        self._qp_h3.value = float(h3)
+        self._qp_Lf3h.value = float(Lf3h)
+        self._qp_Lg3h1.value = float(Lg3h1)
+        self._qp_Lg3h2.value = float(Lg3h2)
+        self._qp_Lg3h3.value = float(Lg3h3)
+        self._qp_rhs3.value = float(-hSlack3 * h3 + nu3)
 
         try:
-            problem.solve(solver=cp.MOSEK, verbose=False, warm_start=True)
+            self._qp_problem.solve(
+                solver=cp.MOSEK,
+                verbose=False,
+                warm_start=True,
+                mosek_params={"MSK_DPAR_OPTIMIZER_MAX_TIME": 0.5},
+            )
         except cp.error.SolverError:
             return np.zeros(3, dtype=float), False
 
-        if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and u.value is not None:
-            return np.asarray(u.value, dtype=float).reshape(3,), True
+        if (
+            self._qp_problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+            and self._qp_u.value is not None
+        ):
+            return np.asarray(self._qp_u.value, dtype=float).reshape(
+                3,
+            ), True
 
         return np.zeros(3, dtype=float), False
-

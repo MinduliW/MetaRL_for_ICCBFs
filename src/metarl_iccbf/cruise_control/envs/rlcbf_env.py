@@ -1,36 +1,24 @@
-import time
 import copy
 import cvxpy as cp
 import gymnasium as gym
 from gymnasium import spaces
-import random
 import math
-import torch as th
 
 import numpy as np
-import pandas as pd
-import torch
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-from typing import Callable, Type
-from scipy import integrate
-from scipy.optimize import minimize 
-from scipy.integrate import trapezoid
+from typing import Literal, overload
 from scipy import integrate
 # from iccbfs import ICCBF
 from metarl_iccbf.cruise_control.iccbf import ICCBF
 from daceypy import DA  # DACEyPy DA type (Differential Algebra)
 
 
-# from ya import YA
-# My Classes
-# from propagations import Propagations
-
 class RLCBFcontrol(gym.Env):
     
 
 
-    def __init__(self, dt, deterministic=False):
+    def __init__(self, dt, deterministic=False,
+                 per_step_vel_penalty: bool = False,
+                 vel_penalty_coef: float = 0.1):
         super(RLCBFcontrol, self).__init__()
    
         DA.init(int(4), int(2))
@@ -68,6 +56,8 @@ class RLCBFcontrol(gym.Env):
         
         self.vinit = 20.0
         self.deterministic = deterministic
+        self.per_step_vel_penalty = per_step_vel_penalty
+        self.vel_penalty_coef = vel_penalty_coef
         self.xinit = 100.0
  
         self.ulim = 0.25      # max thrust / accel magnitude
@@ -109,11 +99,29 @@ class RLCBFcontrol(gym.Env):
         self.thrust_noise_std = 0.1 # actuation noise
         
         self.action_space = spaces.Box(low=aa_lb, high=aa_ub, dtype=np.float64)
-        
+
+        # -- Pre-build parametric QP (built once, re-solved with updated params) --
+        self._qp_Lgh_p   = cp.Parameter()
+        self._qp_h_p     = cp.Parameter()
+        self._qp_rhs_cbf = cp.Parameter()
+        self._qp_LgV_p   = cp.Parameter()
+        self._qp_rhs_clf = cp.Parameter()
+
+        self._qp_u     = cp.Variable(1)
+        self._qp_k     = cp.Variable(nonneg=True)
+        self._qp_delta = cp.Variable(nonneg=True)
+
+        _cost = cp.sum_squares(self._qp_u) + 50.0 * self._qp_delta + 10.0 * self._qp_k
+        _constraints: list[cp.Constraint] = [
+            self._qp_Lgh_p * self._qp_u + self._qp_h_p * self._qp_k >= self._qp_rhs_cbf,
+            self._qp_LgV_p * self._qp_u - self._qp_delta <= self._qp_rhs_clf,
+        ]
+        self._qp_problem = cp.Problem(cp.Minimize(_cost), _constraints)
+
         self.state  = copy.deepcopy(self.x0)
         self.reward = 0.0
         self.sigmaCounter = 0
-    
+
         # Store empty arrays
         self.tt = np.array([0])
         self.yy = np.array(self.x0).reshape(-1, 1)
@@ -130,13 +138,13 @@ class RLCBFcontrol(gym.Env):
     
         return h
     
-    def interval_maxabs(self,I):
+    def interval_maxabs(self, interval):
         # Try common attribute names
         for a, b in [("lb","ub"), ("lower","upper"), ("l","u"), ("inf","sup")]:
-            if hasattr(I, a) and hasattr(I, b):
-                return max(abs(float(getattr(I,a))), abs(float(getattr(I,b))))
+            if hasattr(interval, a) and hasattr(interval, b):
+                return max(abs(float(getattr(interval,a))), abs(float(getattr(interval,b))))
         # Fallback: try indexing
-        return max(abs(float(I[0])), abs(float(I[1])))
+        return max(abs(float(interval[0])), abs(float(interval[1])))
 
     def lipschitz_bound_bounder(self,poly, half_width):
         rd, rv = float(half_width[0]), float(half_width[1])
@@ -194,7 +202,7 @@ class RLCBFcontrol(gym.Env):
 
 
     def nu_lemma2(self, T, l1, l2, Delta, eps=1e-12):
-        nu = l1*T*Delta;
+        nu = l1*T*Delta
         return nu
         # if abs(l2) < eps:
         #     return float(l1 * Delta * T)
@@ -291,6 +299,29 @@ class RLCBFcontrol(gym.Env):
 
 
             
+    @overload
+    def getICCBFvars_dace(
+        self,
+        x0: np.ndarray,
+        a1: float = ...,
+        bcoef1: float = ...,
+        a2: float = ...,
+        bcoef2: float = ...,
+        *,
+        return_polys: Literal[True],
+    ) -> tuple[tuple[float, float, float], dict[str, object]]: ...
+
+    @overload
+    def getICCBFvars_dace(
+        self,
+        x0: np.ndarray,
+        a1: float = ...,
+        bcoef1: float = ...,
+        a2: float = ...,
+        bcoef2: float = ...,
+        return_polys: Literal[False] = ...,
+    ) -> tuple[float, float, float]: ...
+
     def getICCBFvars_dace(
         self,
         x0: np.ndarray,
@@ -385,84 +416,88 @@ class RLCBFcontrol(gym.Env):
 
         return Lgh_val, Lfh_val, h_val
 
+    @staticmethod
+    def _viable_mask(pts, f0, f1, f2, m, g0, ulim, v0, T=40.0, dt=0.1):
+        """Vectorised forward-simulation viability test.
 
-   
+        Simulates all candidate points under max braking (u = -ulim) and
+        returns a boolean mask that is True for points where h = d - 1.8*v
+        stays non-negative for the entire horizon.
+        """
+        x = pts.astype(float).copy()          # (N, 2)  columns: [d, v]
+        viable = np.ones(x.shape[0], dtype=bool)
+        n_steps = int(T / dt)
+        for _ in range(n_steps):
+            v = x[:, 1]
+            F = f0 + f1 * v + f2 * v ** 2
+            x[:, 0] += dt * (v0 - v)          # d_dot = v0 - v
+            x[:, 1] += dt * (-F / m + g0 * (-ulim))  # v_dot, max brake
+            viable &= (x[:, 0] - 1.8 * x[:, 1]) >= 0.0
+        return viable
+
     def getValidPoints(self, include_outside=True, dedupe=True):
-        
-        # x1 = np.arange(0.0, 121.0, 5)
-        # x2 = np.arange(0.0, 25.0, 1) 
-        
-           
+
         x1 = np.arange(0.0, 121.0, 1)
-        x2 = np.arange(0.0, 25.0, 0.5) 
-        
-        
-        # x1 = np.linspace(80.0,101.0,4)
-        # x2 = np.linspace(15.0, 20.0, 4) 
-        
+        x2 = np.arange(0.0, 25.0, 0.5)
 
         X1, X2 = np.meshgrid(x1, x2)
 
+        # Fast pre-filter: h = d - 1.8*v >= 0
         mask1 = (X1 - 1.8 * X2) >= 0.0
-        mask2 = (self.v0 -X2) + 1.8/self.m*(self.f0 + self.f1 * X2 + self.f2 * (X2 ** 2)) + 1.8*self.g0*self.ulim >=0.0
-     
-        combined_mask = mask1  & mask2
-        # Extract only those points that satisfy both conditions
-        X1_valid = X1[combined_mask]
-        X2_valid = X2[combined_mask]
-
-        # Stack them into an (N,2) array
+        X1_valid = X1[mask1]
+        X2_valid = X2[mask1]
         valid_points = np.column_stack((X1_valid, X2_valid))
-     
-        # # also add others 
+
+        # Also add outside-ICCBF points (already filtered by h >= 0)
         include_outside = True
-        
         if include_outside:
             outside_pts = self.pointsoutsideICCBF()
             if outside_pts.size > 0:
-                valid_points = np.vstack((valid_points,outside_pts))
+                valid_points = np.vstack((valid_points, outside_pts))
 
-        # # De-duplicate and sort (optional but handy)
-        # if dedupe and valid_points.size > 0:
-        #     # Round to kill tiny float noise before unique
-        #     vp = np.round(valid_points.astype(float), 6)
-        #     vp = np.unique(vp, axis=0)
-        #     # Sort by x1 then x2
-        #     valid_points = vp[np.lexsort((vp[:, 1], vp[:, 0]))]
-
+        # Forward-simulation viability filter using current episode parameters
+        viable = self._viable_mask(
+            valid_points,
+            self.f0, self.f1, self.f2,
+            self.m, self.g0, self.ulim, self.v0,
+        )
+        valid_points = valid_points[viable]
 
         return valid_points
     
-    def reset(self, seed=0, postProcess=True):
+    def reset(self, *, seed=None, options=None, postProcess=True):
         # DA.init(int(4), int(2))
+        super().reset(seed=seed)
         self.V_values = []
 
         # -------- Meta-RL: sample task parameters at start of episode --------
-        # Uniform factors over ± ranges
+        # Only randomize during training; eval uses nominal params for consistent metrics
+        if not self.deterministic:
+            # Uniform factors over ± ranges
 
-        # mass ±20%  → factor in [0.8, 1.2]
-        mass_factor  = np.random.uniform(0.8, 1.2)
+            # mass ±20%  → factor in [0.8, 1.2]
+            mass_factor  = np.random.uniform(0.8, 1.2)
 
-        # front car speed v0 ±10% → [0.9, 1.1]
-        v0_factor    = np.random.uniform(0.9, 1.1)
+            # front car speed v0 ±10% → [0.9, 1.1]
+            v0_factor    = np.random.uniform(0.9, 1.1)
 
-        # max thrust ulim ±20% → [0.8, 1.2]
-        ulim_factor  = np.random.uniform(0.8, 1.2)
+            # max thrust ulim ±20% → [0.8, 1.2]
+            ulim_factor  = np.random.uniform(0.8, 1.2)
 
-        # target speed vmax ±10% → [0.9, 1.1]
-        vmax_factor  = np.random.uniform(0.9, 1.1)
+            # target speed vmax ±10% → [0.9, 1.1]
+            vmax_factor  = np.random.uniform(0.9, 1.1)
 
-        # apply to actual parameters
-        self.m    = self.base_m    * mass_factor
-        self.v0   = self.base_v0   * v0_factor
-        self.vmax = self.base_vmax * vmax_factor
-        self.ulim = self.base_ulim * ulim_factor
+            # apply to actual parameters
+            self.m    = self.base_m    * mass_factor
+            self.v0   = self.base_v0   * v0_factor
+            self.vmax = self.base_vmax * vmax_factor
+            self.ulim = self.base_ulim * ulim_factor
 
-        # rebuild ICCBF model with new parameters
-        self.ICCBFs = ICCBF(self.f0, self.f1, self.f2, self.m, self.g0, self.vmax, self.v0)
+            # rebuild ICCBF model with new parameters
+            self.ICCBFs = ICCBF(self.f0, self.f1, self.f2, self.m, self.g0, self.vmax, self.v0)
 
-        # recompute valid points so deterministic init sees new ICCBF
-        self.points = self.getValidPoints()
+            # recompute valid points so deterministic init sees new ICCBF
+            self.points = self.getValidPoints()
         # ---------------------------------------------------------------------
 
         if self.deterministic:
@@ -590,14 +625,14 @@ class RLCBFcontrol(gym.Env):
         obs_raw = np.array([d_meas, v_meas])
         return self.scaleObservation(obs_raw)
     
-    def getICCBFvars(self, f,g, a1, bcoef1, a2, bcoef2):
+    def getICCBFvars(self, f, g, a1, bcoef1, a2, bcoef2):
         
         # set to original 
         # a1 = 4; 
-        bcoef1 = 1.0; 
+        bcoef1 = 1.0
         
         # a2 = 7;
-        bcoef2 = 0.5;
+        bcoef2 = 0.5
         
         d_dot = f[0]
         v_dot = f[1]
@@ -788,7 +823,11 @@ class RLCBFcontrol(gym.Env):
         penalty += np.abs(self.u)*2.5
 
         reward = -(penalty)
-     
+
+        if self.per_step_vel_penalty:
+            V_current = (self.x0[1] - self.vmax) ** 2
+            reward -= self.vel_penalty_coef * V_current
+
         truncated = False
         
     
@@ -801,39 +840,26 @@ class RLCBFcontrol(gym.Env):
         V = (self.x0[1] - self.vmax) ** 2
         self.V_values.append(V)
     
-        self.x0 = xnext;
+        self.x0 = xnext
      
-        self.reward += reward;
+        self.reward += reward
 
-        self.ncurrent += 1; 
+        self.ncurrent += 1
         
        
-        finalRewOnly = False;
-        
-        
         if self.tt[-1] >= self.TOF:
-            
             done = True
-            
-            if finalRewOnly == True:
-                reward = self.reward 
-                
-            # if self.isOutsideICCBF == False:
-                if min(self.V_values) > 10:
-                    reward = reward-min(self.V_values)*50
-                
+            if not self.per_step_vel_penalty and min(self.V_values) > 10:
+                reward = reward - min(self.V_values) * 50
         else:
             done = False
-            
-            if finalRewOnly == True:
-                reward = 0
 
+
+        if self.x0[0] < 0.0:   # crash — applied before /50 for scale consistency
+            reward = -500.0
+            done = True
 
         reward = reward / 50.0              # keep returns O(10–100)
-
-        if self.x0[0] < 0.0: # this is a crash
-            reward = -500.0
-            done = True; 
         # # if V < 1e-2:
         #     done = True
             
@@ -874,50 +900,30 @@ class RLCBFcontrol(gym.Env):
         LfV = -2 * (x[1] - self.vmax) / self.m * F       # scalar
         LgV =  2 * (x[1] - self.vmax) * self.g0          # scalar
 
-        u     = cp.Variable(1)
-        k     = cp.Variable(nonneg=True)
-        delta = cp.Variable(nonneg=True)
-
-        cost = cp.sum_squares(u) + 50.0 * delta + 10.0 * k
-        # print(nuMargin)
-
-        constraints = [
-            Lfh + Lgh * u >= -(hslack + k) * h + nuMargin,
-            LfV + LgV * u <= -Lslack * V + delta,
-        ]
-
-        problem = cp.Problem(cp.Minimize(cost), constraints)
-
-        # mosek_opts = {
-        #     # conic interior-point tolerances
-        #     "MSK_DPAR_INTPNT_CO_TOL_PFEAS":   1e-7,
-        #     "MSK_DPAR_INTPNT_CO_TOL_DFEAS":   1e-7,
-        #     "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": 1e-7,
-        #     "MSK_DPAR_INTPNT_CO_TOL_MU_RED":  1e-10,
-        #     # optional: limit iterations to keep things predictable
-        #     # "MSK_IPAR_INTPNT_MAX_ITERATIONS": 50,
-        # }
+        # Update parameters (no problem rebuild — just swap values)
+        self._qp_Lgh_p.value   = float(Lgh)
+        self._qp_h_p.value     = float(h)
+        self._qp_rhs_cbf.value = float(nuMargin - Lfh - hslack * h)
+        self._qp_LgV_p.value   = float(LgV)
+        self._qp_rhs_clf.value = float(-Lslack * V - LfV)
 
         try:
-            problem.solve(
+            self._qp_problem.solve(
                 solver=cp.MOSEK,
                 verbose=False,
-                warm_start=True,     # helps a *lot* for jitter between steps
+                warm_start=True,
             )
 
-            if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                uOpt     = float(u.value)
-                deltaVal = float(delta.value)
-                isSolved = True
+            if self._qp_problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                uOpt     = float(self._qp_u.value) if self._qp_u.value is not None else 0.0
+                deltaVal = float(self._qp_delta.value) if self._qp_delta.value is not None else 0.0
             else:
                 uOpt = 0.0
                 deltaVal = 0.0
-                isSolved = False
 
-        except cp.error.SolverError:
+        except Exception:
             uOpt = 0.0
             deltaVal = 0.0
-            isSolved = False
 
         return uOpt, deltaVal
 

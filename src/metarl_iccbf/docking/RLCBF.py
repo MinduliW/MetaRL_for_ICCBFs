@@ -1,40 +1,30 @@
 # consider also adding Lfh 
 # Also scale Lgh right
-import time
 import copy
 import json
 from typing import Optional, Dict, Any
 
-from pathlib import Path
-import cvxpy as cp
 import gymnasium as gym
 from gymnasium import spaces
-import random
 from math import *
 # from sympy import symbols, diff, cos, sin, sqrt, Function, Matrix
-import itertools
 import numpy as np
-import pandas as pd
-import torch as th
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-from typing import Callable, Type
+
 from scipy import integrate
-from scipy.optimize import minimize 
-from scipy.integrate import trapezoid
-from scipy import integrate
-import sympy as sp
-from docking.Dockingcase import DockingCase
-from docking.dynamicsandControl import dynamicsAndControl
-from docking.iccbfs import ICCBF
+from .Dockingcase import DockingCase
+from .dynamicsandControl import dynamicsAndControl
+from .iccbfs import ICCBF
 
 class RLCBFcontrol(gym.Env):
 
-    def __init__(self, dt, deterministic=False, nInitstates=10, setconst=False):
+    def __init__(self, dt, deterministic=False, nInitstates=10, setconst=False,
+                 adversarial=False, tof=50.0, adv_omega_min=None, adv_omega_max=None,
+                 adv_delta_omega=None, adv_delta_omega_max=None,
+                 morl: bool = False):
         super(RLCBFcontrol, self).__init__()
       
         self.onestep = False 
-        self.TOF = 50.0
+        self.TOF = tof
         self.mu = 398600.0
         self.setconst = setconst
   
@@ -63,6 +53,16 @@ class RLCBFcontrol(gym.Env):
         # umax is defined below; base_umax will be set after that
         # ------------------------------------------------------------------------
 
+        # ---------- Adversarial target parameters ----------
+        self.adversarial = adversarial
+        self.adv_omega_min = adv_omega_min if adv_omega_min is not None else 0.0 * np.pi / 180.0
+        self.adv_omega_max = adv_omega_max if adv_omega_max is not None else 0.7 * np.pi / 180.0
+        self.adv_delta_omega = adv_delta_omega if adv_delta_omega is not None else 0.02 * np.pi / 180.0
+        self.adv_delta_omega_max = adv_delta_omega_max if adv_delta_omega_max is not None else 0.02 * np.pi / 180.0
+        self.om_true = self.om
+        self.om_iccbf = self.om
+        # ---------------------------------------------------
+
         self.dockingCase = DockingCase(rho=self.rho, gamma=self.gamma)
         self.dynamics = dynamicsAndControl(mu=self.mu, n=self.n, r=self.r, m=self.m, om=self.om)
         
@@ -90,7 +90,7 @@ class RLCBFcontrol(gym.Env):
         ) = self.iccbf.getICCBFs()
 
 
-        self.getmargin_docking = self.iccbf.getmargin;
+        self.getmargin_docking = self.iccbf.getmargin
 
         self.validPoints = self.dockingCase.generate_evenly_spread_cone_points_2d()
         
@@ -113,9 +113,10 @@ class RLCBFcontrol(gym.Env):
         self.obslow = np.array([
             -200/1e3, -200/1e3, -20/1e3, -20/1e3, 0.0
         ])
+        om_for_scaling = self.adv_omega_max if self.adversarial else self.om
         self.obshigh = np.array([
             200/1e3, 200/1e3, 20/1e3, 20/1e3,
-            1.2*self.om*(self.TOF+0.5)
+            1.2*om_for_scaling*(self.TOF+0.5)
         ])
 
         num_actions = 4
@@ -127,6 +128,21 @@ class RLCBFcontrol(gym.Env):
         
         self.reward = 0.0
         self.sigmaCounter = 0
+
+        # -------------------------
+        # MORL: vector reward mode
+        # -------------------------
+        self.morl = bool(morl)
+        if self.morl:
+            # reward_space: [fuel_component, safety_component]
+            # fuel_component:   -(fuel_ratio penalty) − terminal_distance_penalty + success_bonus
+            # safety_component: -(CBF violation penalty) + success_bonus
+            self.reward_space = spaces.Box(
+                low=np.array([-np.inf, -np.inf], dtype=np.float32),
+                high=np.array([np.inf, np.inf], dtype=np.float32),
+                shape=(2,),
+                dtype=np.float32,
+            )
     
         # Store empty arrays
         self.tt = np.array([0])
@@ -138,6 +154,10 @@ class RLCBFcontrol(gym.Env):
         self.store_cert_history = False # set True for debug runs (can be large)
 
         
+    def getValidPoints(self):
+        """Return fixed evaluation initial conditions (N, 5)."""
+        return self.validPoints
+
     def reset(self, seed=0, postProcess=True):
         self.ncurrent = 0
         self.safe_so_far = True
@@ -173,7 +193,7 @@ class RLCBFcontrol(gym.Env):
        
         self.iccbf = ICCBF(mu=self.mu, r=self.r, gamma=self.gamma,rho=self.rho,m = self.m, om=self.om,umax=self.umax)
         
-        self.getmargin_docking = self.iccbf.getmargin;
+        self.getmargin_docking = self.iccbf.getmargin
         
 
         # Rebuild dynamics and docking geometry with new parameters
@@ -181,10 +201,18 @@ class RLCBFcontrol(gym.Env):
         self.dynamics = dynamicsAndControl(mu=self.mu, n=self.n, r=self.r, m=self.m, om=self.om)
         self.validPoints = self.dockingCase.generate_evenly_spread_cone_points_2d()
 
-        # Update observation scaling bounds that depend on om
-        # self.obshigh[4] = self.om * (self.TOF + 0.5)
-        # self.obshigh[10] = self.om
+        # ---------- Adversarial target: initialize omega state ----------
+        if self.adversarial:
+            self.om_true = self.om       # initial omega from meta-RL sampling
+            self.om_iccbf = self.om      # no lag at t=0
+            self.obshigh[4] = 1.2 * self.adv_omega_max * (self.TOF + 0.5)
+        else:
+            self.om_true = self.om
+            self.om_iccbf = self.om
         # ---------------------------------------------------------------------------
+
+        _MAX_IC_RETRIES = 50
+        _safe_fallback = np.array([100.0/1e3, 0.0, 0.0, 0.0, 0.0])
 
         if self.deterministic:
             ycoord = np.linspace(
@@ -192,31 +220,45 @@ class RLCBFcontrol(gym.Env):
                 (90.0/1e3 - self.rho - 1e-3) * np.tan(self.gamma),
                 self.nInitstates
             )
-            
+
             self.sigmaCounter = self.sigmaCounter + 1
             if self.sigmaCounter > len(ycoord):
                 self.sigmaCounter = 1
- 
+
             self.x0 = np.array([100.0/1e3, ycoord[self.sigmaCounter-1], 0.0, 0.0, 0.0])
+
+            # Clamp to safe fallback if IC is infeasible
+            if self.dockingCase.originalh(self.x0) < 0.0:
+                import warnings
+                warnings.warn("Deterministic IC in unsafe set — falling back to cone centerline")
+                self.x0 = _safe_fallback.copy()
         else:
             ycoord = np.linspace(
                 -(90.0/1e3 - self.rho) * np.tan(self.gamma),
                 (90.0/1e3 - self.rho - 1e-3) * np.tan(self.gamma),
-                 self.nInitstates
+                self.nInitstates
             )
-            indx = np.random.randint(0,  self.nInitstates-1)
-            self.x0 = np.array([100.0/1e3, ycoord[indx], 0.0, 0.0, 0.0])
+
+            accepted = False
+            for _ in range(_MAX_IC_RETRIES):
+                indx = np.random.randint(0, self.nInitstates - 1)
+                candidate = np.array([100.0/1e3, ycoord[indx], 0.0, 0.0, 0.0])
+                if self.dockingCase.originalh(candidate) >= 0.0:
+                    self.x0 = candidate
+                    accepted = True
+                    break
+
+            if not accepted:
+                import warnings
+                warnings.warn("No feasible IC found after retries — falling back to cone centerline")
+                self.x0 = _safe_fallback.copy()
 
         self.reward = 0
-        self.rewardCurrent = 0 
+        self.rewardCurrent = 0
 
         # Store empty arrays
         self.tt = np.array(0)
 
-        h = self.dockingCase.originalh(self.x0)
-        
-        if h < 0.0:
-            print('Initial condition is in unsafe set!')
         observation = self.x0
 
         observation = self.scaleObservation(observation)
@@ -258,7 +300,31 @@ class RLCBFcontrol(gym.Env):
 
         return u
 
-    
+    def _adversary_update(self, tstep):
+        """Adversarial target: compute next omega using finite-difference gradient of h."""
+        # Current true omega becomes stale for next step's ICCBF
+        self.om_iccbf = self.om_true
+
+        x_next = self.x0.copy()
+        phi_now = x_next[4]
+        x_test = x_next.copy()
+
+        # h with omega + delta_omega
+        x_test[4] = phi_now + (self.om_true + self.adv_delta_omega) * tstep
+        h_plus = self.dockingCase.originalh(x_test)
+
+        # h with omega - delta_omega
+        x_test[4] = phi_now + (self.om_true - self.adv_delta_omega) * tstep
+        h_minus = self.dockingCase.originalh(x_test)
+
+        # Bang-bang: pick direction that minimizes h
+        if h_minus < h_plus:
+            om_new = self.om_true - self.adv_delta_omega_max
+        else:
+            om_new = self.om_true + self.adv_delta_omega_max
+
+        self.om_true = float(np.clip(om_new, self.adv_omega_min, self.adv_omega_max))
+
     def softplus(self, x, beta=50.0):
         # stable softplus(beta*x)/beta
         z = beta * x
@@ -328,19 +394,30 @@ class RLCBFcontrol(gym.Env):
     
     
         tstepCurrent = self.tstep
-       
+
+        # ---------- Adversarial omega routing ----------
+        if self.adversarial:
+            om_for_iccbf = self.om_iccbf
+            om_for_dynamics = self.om_true
+        else:
+            om_for_iccbf = self.om
+            om_for_dynamics = self.om
+
         if self.tt.size == 1:
             t0 = 0.0
-        else: 
+        else:
             t0 = np.squeeze(self.tt)[-1]
-            
+
         tf = t0 + tstepCurrent
         tf = round(tf,6)
         self.tt = np.append(self.tt, tf)
 
+        # ICCBF computation uses stale omega (in adversarial mode)
+        self.dynamics.om = om_for_iccbf
+        self.iccbf.om = om_for_iccbf
         f_x,g_x = self.dynamics.getfxgx(self.x0)
-         
-        stateAndcoefs = list(self.x0.flatten()) + [acoef1, acoef2, self.rho, self.m, self.om,self.gamma, self.r]
+
+        stateAndcoefs = list(self.x0.flatten()) + [acoef1, acoef2, self.rho, self.m, om_for_iccbf, self.gamma, self.r]
 
         Lgb11 = self.Lgb1_1_func(*stateAndcoefs )
         Lgb12 = self.Lgb1_2_func(*stateAndcoefs)
@@ -407,12 +484,17 @@ class RLCBFcontrol(gym.Env):
             self.control = uOpt
             
     
+        # Switch to true omega for ODE propagation
+        self.dynamics.om = om_for_dynamics
+
         ode_out = integrate.solve_ivp(fun=lambda t, y: self.dynamics.ccDynamicsV2(t, y,uOpt=self.control),
-                        t_span=(0.0, tstepCurrent), y0=self.x0, method='RK45', dense_output=False,     rtol=1e-8, atol=1e-8)
-   
-      
+                        t_span=(0.0, tstepCurrent), y0=self.x0, method='RK45', dense_output=False,     rtol=1e-6, atol=1e-6)
+
         self.x0 = ode_out.y[:,-1]
-    
+
+        # Adversary updates omega for the next step
+        if self.adversarial:
+            self._adversary_update(tstepCurrent)
 
         originalCBF = self.dockingCase.originalh(self.x0)
         
@@ -445,28 +527,35 @@ class RLCBFcontrol(gym.Env):
         penalty_u = w_u * fuel_ratio
 
         reward = -(penalty_u + penalty_h + penalty_validityk)
-     
+
         truncated = False
-        
+
         info = {}
-        
-        distance_to_end = np.sqrt((self.x0[0] - self.rho)**2 + self.x0[1]**2)
+        if self.adversarial:
+            info["om_true"] = self.om_true
+            info["om_iccbf"] = self.om_iccbf
+
+        np.sqrt((self.x0[0] - self.rho)**2 + self.x0[1]**2)
 
         observationUscl = self.x0
         observation =  self._get_observation(observationUscl)
-        
-        self.obsPrev = observation;
-       
+
+        self.obsPrev = observation
+
         self.ncurrent += 1
 
         # Compute Lyapunov-like function (raw)
         V_raw, _ = self.dockingCase.calculate_V_and_dV(self.x0)
         # Rescale for reward shaping so it's O(1–10)
-        V_scaled = V_raw/ 1e6
+        V_scaled = V_raw / 1e6
 
         # Success detection: small V AND never violated CBF
-        success_threshold = 0.03/1e6
+        success_threshold = 0.03 / 1e6
         success_bonus = 0.01
+
+        # Per-component MORL tracking (updated below alongside scalar reward)
+        fuel_step = -penalty_u
+        safety_step = -(penalty_h + penalty_validityk)
 
         # 1) Time horizon reached: terminal shaping
         if self.tt[-1] >= self.TOF:
@@ -475,11 +564,14 @@ class RLCBFcontrol(gym.Env):
             w_V = 5.0
             # If still far from target, penalise
             if V_scaled > success_threshold:
-                reward -= w_V * V_scaled 
+                reward -= w_V * V_scaled
+                fuel_step -= w_V * V_scaled  # distance-to-goal is a fuel/efficiency concern
 
             # If we achieved a nice target state AND stayed safe all along:
             if (V_scaled <= success_threshold) and self.safe_so_far:
                 reward += success_bonus
+                fuel_step += success_bonus
+                safety_step += success_bonus
                 info["success"] = True
 
         else:
@@ -487,20 +579,29 @@ class RLCBFcontrol(gym.Env):
             if (V_scaled <= success_threshold) and self.safe_so_far:
                 done = True
                 reward += success_bonus
+                fuel_step += success_bonus
+                safety_step += success_bonus
                 info["success"] = True
-            
+
             else:
                 done = False
-                
-        if np.linalg.norm(self.x0[:2]) <= 3/1e3:
-            done = True; 
-            
-        
+
+        if np.linalg.norm(self.x0[:2]) <= 3 / 1e3:
+            done = True
+
         if originalCBF < 0.0:
-            reward -= 100.0
+            reward = -10.0
+            safety_step = -10.0  # CBF crash penalty goes entirely to safety component
             done = True
 
         truncated = False
+
+        info["fuel_penalty"] = penalty_u
+        info["safety_penalty"] = penalty_h + penalty_validityk + (10.0 if originalCBF < 0.0 else 0.0)
+
+        if self.morl:
+            r_vec = np.array([fuel_step, safety_step], dtype=np.float32)
+            return observation, r_vec, done, truncated, info
 
         return observation, reward, done, truncated, info
 
@@ -620,7 +721,3 @@ class RLCBFcontrol(gym.Env):
         keys = sorted(hist[0].keys())
         out = {k: np.array([h.get(k, np.nan) for h in hist], dtype=np.float64) for k in keys}
         np.savez(path, **out)
-    
-
-
-

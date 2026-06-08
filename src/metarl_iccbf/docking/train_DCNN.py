@@ -27,7 +27,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import EvalCallback
 
 # Docking env (your current docking setup)
-from docking.RLCBF import RLCBFcontrol
+from .RLCBF import RLCBFcontrol
 
 # Optional: differential algebra initialisation (safe to keep behind a flag)
 try:

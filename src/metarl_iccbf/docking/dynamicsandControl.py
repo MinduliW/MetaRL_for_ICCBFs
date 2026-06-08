@@ -1,6 +1,6 @@
 import numpy as np
 import cvxpy as cp
-from docking.Dockingcase import DockingCase
+from .Dockingcase import DockingCase
 class dynamicsAndControl:
     def __init__(self, mu, n, r, m, om):
         """
@@ -108,10 +108,3 @@ class dynamicsAndControl:
         psi  = float(x[4]) + om * dt
 
         return np.concatenate([x4new, [psi]]).astype(np.float64)
-        
-        
-        
-    
-    
-    
- 

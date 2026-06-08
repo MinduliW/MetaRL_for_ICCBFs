@@ -20,6 +20,10 @@ class InspectionEnv(gym.Env):
             eval_bank_size: int = 100,
             eval_bank_seed: int = 0,
             regenerate_eval_bank: bool = False,
+            adversarial: bool = False,
+            dv_budget_range: tuple = (0.5, 5.0),
+            morl: bool = False,
+            morl_coverage_threshold: float = 0.8,
         ):
   
 
@@ -140,6 +144,31 @@ class InspectionEnv(gym.Env):
         self.control = np.zeros(3, dtype=np.float64)   # last control (force)
         self.last_u_rl = np.zeros(3, dtype=np.float64)
         self.last_u_safe = np.zeros(3, dtype=np.float64)
+
+        # -------------------------
+        # MORL: vector reward mode
+        # -------------------------
+        self.morl = bool(morl)
+        self.morl_coverage_threshold = float(morl_coverage_threshold)
+        if self.morl:
+            # reward_space: [fuel_component, safety_component]
+            # fuel_component  = coverage_reward - fuel_cost  (maximise coverage, minimise ΔV)
+            # safety_component = coverage_reward - safety_penalties  (maximise coverage, avoid CBF violations)
+            self.reward_space = spaces.Box(
+                low=np.array([-np.inf, -np.inf], dtype=np.float32),
+                high=np.array([np.inf, np.inf], dtype=np.float32),
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+        # -------------------------
+        # Adversarial chief
+        # -------------------------
+        self.adversarial = bool(adversarial)
+        self.dv_budget_range = (float(dv_budget_range[0]), float(dv_budget_range[1]))
+        self.dv_budget = 0.0
+        self.dv_per_step = 0.0
+        self.dv_remaining = 0.0
 
         # -------------------------
         # Reward / logging placeholders
@@ -303,6 +332,17 @@ class InspectionEnv(gym.Env):
         else:
             rng = np.random.default_rng(seed) if seed is not None else self._rng
             self.state = self._sample_initial_state(rng)
+
+        # --- Adversarial budget ---
+        if self.adversarial:
+            rng = np.random.default_rng(seed) if seed is not None else self._rng
+            self.dv_budget = float(rng.uniform(*self.dv_budget_range))
+            self.dv_per_step = self.dv_budget / float(self.MAX_STEPS)
+            self.dv_remaining = self.dv_budget
+        else:
+            self.dv_budget = 0.0
+            self.dv_per_step = 0.0
+            self.dv_remaining = 0.0
 
         # --- Standard reset bookkeeping ---
         self.steps_done = 0
@@ -472,6 +512,16 @@ class InspectionEnv(gym.Env):
 
         # propagate with SAFE thrust
         self.state = self.dynamics.propwithCW(self.state, u_safe, self.DT)
+
+        # passive adversarial chief: velocity impulse away from deputy
+        if self.adversarial and self.dv_remaining > 1e-9:
+            r = self.state[:3]
+            r_norm = float(np.linalg.norm(r))
+            if r_norm > 1e-9:
+                dv_k = min(self.dv_per_step, self.dv_remaining)
+                self.state[3:6] += dv_k * (r / r_norm)
+                self.dv_remaining -= dv_k
+
         self.steps_done += 1
 
         obs_dict = self.obs_model.get_observation(self.state)
@@ -481,40 +531,34 @@ class InspectionEnv(gym.Env):
         num_new = int(newly_inspected.sum())
         self.inspected |= visible
 
-        reward = float(num_new)*0.1
+        coverage_reward = float(num_new) * 0.1
 
         pos = self.state[:3]
         r_norm = np.linalg.norm(pos)
-        
-        # fuel consumption reward 
-        dV_rl  = (np.abs(u_rl[0])+ np.abs(u_rl[1]) + np.abs(u_rl[2]))/self.m*self.DT; 
-        reward -= 0.02*dV_rl 
-        
-        # crash reward - negative reward if distance from cheif is less than collision radius 
-        if r_norm < self.R_D + self.R_C:
-            reward -= 1.0
+
+        # fuel consumption
+        dV_rl = (np.abs(u_rl[0]) + np.abs(u_rl[1]) + np.abs(u_rl[2])) / self.m * self.DT
+        fuel_penalty = 0.02 * dV_rl
+
+        # crash penalty
+        crash_penalty = 1.0 if r_norm < self.R_D + self.R_C else 0.0
 
         terminated = False
         truncated = False
-        
+
         # check CBF conditions h3
         rs = self._sun_direction(self.state[6])
-        h3 = self.CBF3Vals.h_func(*list(self.state[:6].flatten()) + [rs[0], rs[1], rs[2]] + [a1, a2, b1,b2,c1,c2])
+        h3 = self.CBF3Vals.h_func(*list(self.state[:6].flatten()) + [rs[0], rs[1], rs[2]] + [a1, a2, b1, b2, c1, c2])
+        cbf_penalty = 10.0 if h3 < 0.0 else 0.0
+
         if h3 < 0.0:
             terminated = True
-            reward -= 10.0
-
-        if r_norm <=  self.R_D + self.R_C: #collision 
+        if r_norm <= self.R_D + self.R_C:
             terminated = True
-            # reward -= 10.0
-
         if r_norm > self.R_MAX:
             terminated = True
-            # reward -= 10.0
-
         if self.inspected.all():
             terminated = True
-            # reward += 20.0
 
         if self.steps_done >= self.MAX_STEPS and not terminated:
             truncated = True
@@ -528,7 +572,28 @@ class InspectionEnv(gym.Env):
             "u_rl": self.last_u_rl.copy(),
             "u_safe": self.last_u_safe.copy(),
             "qp_status": qp_status,
+            "dv_budget": float(self.dv_budget),
+            "dv_remaining": float(self.dv_remaining),
+            "fuel_penalty": fuel_penalty,
+            "safety_penalty": crash_penalty + cbf_penalty,
         }
+
+        if self.morl:
+            # Coverage ≥ threshold → truncate (success condition instead of reward component)
+            coverage_frac = float(self.inspected.sum()) / self.N_POINTS
+            if coverage_frac >= self.morl_coverage_threshold and not terminated:
+                truncated = True
+            # fuel_component:   coverage incentive − fuel cost
+            # safety_component: coverage incentive − safety penalties
+            r_vec = np.array(
+                [coverage_reward - fuel_penalty,
+                 coverage_reward - crash_penalty - cbf_penalty],
+                dtype=np.float32,
+            )
+            return obs, r_vec, terminated, truncated, info
+
+        # --- scalar reward (default, unchanged behaviour) ---
+        reward = coverage_reward - fuel_penalty - crash_penalty - cbf_penalty
         return obs, reward, terminated, truncated, info
 
  

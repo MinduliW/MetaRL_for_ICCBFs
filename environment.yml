@@ -1,32 +1,12 @@
-name: iccbf-notebooks
+name: metarl-iccbf
 channels:
+  - nvidia
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
   - pip
-  - numpy
-  - scipy
-  - matplotlib
-  - pandas
-  - jupyter
-  - ipykernel
-  - cvxpy
-  - astropy
-  - tqdm
-  - pyyaml
-  # conda-only / painful-on-pip
-  - ipopt
-  - nlopt
-  - pagmo
-  - pygmo
-  - pykep
-  # optional, only if you truly depend on it in notebooks
-  # - daceypy
-  - pip:
-      - gymnasium
-      - stable-baselines3
-      - torch
-      - sympy
-      - symengine
-
-
+  - swig           # for box2d-py
+  # nvcc matching torch's bundled CUDA (cu128 → 12.8.93).
+  # This lets causal-conv1d and mamba-ssm build from source.
+  - cuda-nvcc=12.8.93

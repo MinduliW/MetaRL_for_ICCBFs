@@ -2,31 +2,33 @@
 
 Docking plotting utilities (Python port of your MATLAB rotating-docking visualisation).
 
-This is the docking analogue of `cruisecontrol.plot_cc_results.plot_cruisecontrol_threeway`.
-
 Usage
 -----
-from plot_docking_results import plot_docking_threeway
+from plot_docking_results import plot_docking_comparison
 
-out = plot_docking_threeway(
-    baseline_mat="Docking_noRL.mat",
-    mlp_mat="Docking_NNfinal.mat",
-    rnn_mat="Docking_RNN.mat",
-    save_prefix=None,  # or "figs/docking"
+out = plot_docking_comparison(
+    mat_paths=[
+        "Docking_noRL.mat",
+        "Docking_NNfinal.mat",
+        "Docking_RNN.mat",
+        "Docking_Mamba2.mat",
+    ],
+    model_names=["ICCBF", "MLP-tuned", "RNN-tuned", "Mamba2-tuned"],
+    save_prefix="figs/docking",
 )
 
 print(out["latex_table"])
 
 What it does
 ------------
-Given 3 .mat result files (ICCBF, MLP-tuned, RNN-tuned), this module:
+Given N .mat result files, this module:
   1) Loads each .mat (scipy.io.loadmat).
-  2) Computes success/failure from `hs` (preferred), else from `dones` if present.
-  3) Builds a 3x3 figure:
+  2) Computes success/failure from `hs` (barrier violation = hs < 0).
+  3) Builds an Nx3 figure:
        Row 1: XY trajectories with rotating cone overlay (start + end).
        Row 2: h(t) (cropped; y=0 reference)
        Row 3: V(t) if present (cropped)
-  4) Builds a violin/box-style plot (matplotlib) of total thrust for all episodes.
+  4) Builds a violin/box-style plot (matplotlib) of total ΔV [m/s] for all episodes.
   5) Returns a dict with arrays + a LaTeX table string.
 
 Expected .mat fields (flexible)
@@ -101,9 +103,9 @@ def _infer_failures(M: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
       is_fail: (N,) bool
       k_fail:  (N,) first index (1..Nt) where failure occurs; Nt if never fails
 
-    Preference:
-      1) hs < 0
-      2) dones == True
+    Only uses ``hs < 0`` (barrier violation) as a failure signal.  The
+    ``dones`` array records episode *termination* (success or failure)
+    and is therefore not a reliable failure indicator.
     """
     X = np.asarray(M["states"])
     N, Nt = X.shape[0], X.shape[1]
@@ -118,18 +120,22 @@ def _infer_failures(M: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
                 k_fail[i] = int(idx[0] + 1)
         return is_fail, k_fail
 
-    D = _as_2d(M.get("dones", None))
-    if D is not None and D.shape[0] == N and D.shape[1] == Nt:
-        Db = D.astype(bool)
-        is_fail = np.any(Db, axis=1)
-        k_fail = np.full(N, Nt, dtype=int)
-        for i in range(N):
-            idx = np.where(Db[i, :])[0]
-            if idx.size:
-                k_fail[i] = int(idx[0] + 1)
-        return is_fail, k_fail
-
     return np.zeros(N, dtype=bool), np.full(N, Nt, dtype=int)
+
+
+def _infer_docking_success(M: Dict[str, Any], is_fail: np.ndarray, lenvec: int) -> np.ndarray:
+    """Return is_docked bool array (True = successfully docked).
+
+    Uses the ``docked`` field saved by eval_parallel if present.
+    Falls back to inferring from early termination: steps_taken < lenvec
+    AND no barrier violation (is_fail == False).
+    """
+    if "docked" in M:
+        return np.asarray(M["docked"]).reshape(-1).astype(bool)
+    if "steps_taken" in M:
+        st = np.asarray(M["steps_taken"]).reshape(-1)
+        return (st < lenvec) & (~is_fail)
+    return ~is_fail  # fallback
 
 
 def _compute_kstop(M: Dict[str, Any], i: int, Nt: int, is_fail_i: bool, k_fail_i: int) -> int:
@@ -173,12 +179,25 @@ def _compute_kstop(M: Dict[str, Any], i: int, Nt: int, is_fail_i: bool, k_fail_i
     return int(k_stop)
 
 
-def _total_thrust(M: Dict[str, Any], i: int, k_stop: int, dt: float) -> float:
+def _total_thrust(M: Dict[str, Any], i: int, k_stop: int, dt: float, m: float = 1.0) -> float:
+    """Return total ΔV [m/s] for episode *i*.
+
+    Dynamics use km-based units (mu in km³/s²), so control/m gives km/s².
+    Multiplying by 1000 converts the final km/s result to m/s.
+
+    Prefers the precomputed ``uTotal`` field (present in all eval .mat
+    files) over recomputing from the control array, which may contain
+    RL actions rather than physical controls.
+    """
+    if "uTotal" in M:
+        ut = np.asarray(M["uTotal"]).reshape(-1)
+        if ut.shape[0] > i:
+            return float(ut[i]) / m * 1000.0
     U = _get_control_array(M)
     if U is None:
         return float("nan")
     Ui = U[i, :k_stop, :]
-    return float(np.sum(np.linalg.norm(Ui, axis=1)) * dt)
+    return float(np.sum(np.linalg.norm(Ui, axis=1)) * dt) / m * 1000.0
 
 
 def _plot_cones(ax: plt.Axes, R: float, alpha0: float, alphaT: float, half_angle: float) -> None:
@@ -197,15 +216,29 @@ def _plot_cones(ax: plt.Axes, R: float, alpha0: float, alphaT: float, half_angle
 
 def _violin_box(ax: plt.Axes, data: List[np.ndarray], labels: Sequence[str]) -> None:
     clean = [d[~np.isnan(d)] for d in data]
-    ax.violinplot(clean, showmeans=False, showmedians=True, showextrema=False)
-    ax.boxplot(clean, widths=0.2, showfliers=False)
-    ax.set_xticks(np.arange(1, len(labels) + 1))
+    positions = np.arange(1, len(labels) + 1)
+    # violinplot requires at least one data point per dataset; skip empty ones
+    nonempty_data = [c for c in clean if c.size > 0]
+    nonempty_pos = [p for c, p in zip(clean, positions) if c.size > 0]
+    if nonempty_data:
+        ax.violinplot(nonempty_data, positions=nonempty_pos,
+                      showmeans=False, showmedians=True, showextrema=False)
+    # boxplot also needs non-empty data per position; replace empty with NaN placeholder
+    box_data = [c if c.size > 0 else np.array([float("nan")]) for c in clean]
+    ax.boxplot(box_data, positions=positions, widths=0.2, showfliers=False)
+    ax.set_xticks(positions)
     ax.set_xticklabels(labels)
 
 
-def _latex_table_from_arrays(u_totals: List[np.ndarray], names: Sequence[str]) -> str:
+def _latex_table_from_arrays(
+    u_totals: List[np.ndarray],
+    names: Sequence[str],
+    safety_rates: Optional[Sequence[float]] = None,
+    dock_rates: Optional[Sequence[float]] = None,
+    u_totals_docked: Optional[List[np.ndarray]] = None,
+) -> str:
     rows = []
-    for name, u in zip(names, u_totals):
+    for j, (name, u) in enumerate(zip(names, u_totals)):
         v = u[~np.isnan(u)]
         if v.size == 0:
             mu = sd = med = q25 = q75 = float("nan")
@@ -214,26 +247,59 @@ def _latex_table_from_arrays(u_totals: List[np.ndarray], names: Sequence[str]) -
             sd = float(np.std(v))
             med = float(np.median(v))
             q25, q75 = np.percentile(v, [25, 75]).astype(float)
-        rows.append((name, mu, sd, med, q25, q75))
+        sr = float(safety_rates[j]) if safety_rates is not None else float("nan")
+        dr = float(dock_rates[j]) if dock_rates is not None else float("nan")
+        # Mean fuel conditioned on successful docking
+        if u_totals_docked is not None:
+            ud = u_totals_docked[j]
+            ud = ud[~np.isnan(ud)]
+            mu_docked = float(np.mean(ud)) if ud.size > 0 else float("nan")
+        else:
+            mu_docked = float("nan")
+        rows.append((name, mu, sd, med, q25, q75, sr, dr, mu_docked))
+
+    has_safety = safety_rates is not None
+    has_dock = dock_rates is not None
+    has_docked_fuel = u_totals_docked is not None
+
+    # Build column spec and header dynamically
+    col_spec = "lccccc"
+    header = r"Method & Mean & Std & Median & 25\% & 75\%"
+    if has_safety:
+        col_spec += "c"
+        header += r" & Safety \%"
+    if has_dock:
+        col_spec += "c"
+        header += r" & Dock \%"
+    if has_docked_fuel:
+        col_spec += "c"
+        header += r" & $\Delta V$\,|\,Docked [m/s]"
+    header += r" \\"
 
     lines = [
-        r"\\begin{tabular}{lccccc}",
-        r"\\hline",
-        r"Method & Mean & Std & Median & 25\\% & 75\\% \\\\",
-        r"\\hline",
+        fr"\begin{{tabular}}{{{col_spec}}}",
+        r"\hline",
+        header,
+        r"\hline",
     ]
-    for (name, mu, sd, med, q25, q75) in rows:
-        lines.append(f"{name} & {mu:.3f} & {sd:.3f} & {med:.3f} & {q25:.3f} & {q75:.3f} \\\\")
-    lines += [r"\\hline", r"\\end{tabular}"]
+    for (name, mu, sd, med, q25, q75, sr, dr, mu_d) in rows:
+        row = fr"{name} & {mu:.3f} & {sd:.3f} & {med:.3f} & {q25:.3f} & {q75:.3f}"
+        if has_safety:
+            row += f" & {sr:.1f}" if np.isfinite(sr) else " & --"
+        if has_dock:
+            row += f" & {dr:.1f}" if np.isfinite(dr) else " & --"
+        if has_docked_fuel:
+            row += f" & {mu_d:.3f}" if np.isfinite(mu_d) else " & --"
+        row += r" \\"
+        lines.append(row)
+    lines += [r"\hline", r"\end{tabular}"]
     return "\n".join(lines)
 
 
-def plot_docking_threeway(
-    baseline_mat: str,
-    mlp_mat: str,
-    rnn_mat: str,
+def plot_docking_comparison(
+    mat_paths: Sequence[str],
+    model_names: Optional[Sequence[str]] = None,
     save_prefix: Optional[str] = None,
-    model_names: Tuple[str, str, str] = ("ICCBF", "MLP-tuned ICCBF", "RNN-tuned ICCBF"),
     stride_traj: int = 5,
     stride_ts: int = 1,
     Nsucc_plot: int = 1000,
@@ -244,20 +310,41 @@ def plot_docking_threeway(
     cone_half_deg: float = 10.0,
     alpha0_deg: float = 0.0,
 ) -> Dict[str, Any]:
-    """Three-way docking comparison (grid + violin + latex table)."""
+    """N-way docking comparison (grid + violin + latex table).
 
-    paths = (baseline_mat, mlp_mat, rnn_mat)
-    Ms = [load_mat(p) for p in paths]
+    Parameters
+    ----------
+    mat_paths : sequence of str
+        Paths to .mat result files (any number >= 1).
+    model_names : sequence of str or None
+        Display names; defaults to ``["Model 0", "Model 1", ...]``.
+    """
+    n_models = len(mat_paths)
+    if model_names is None:
+        model_names = [f"Model {i}" for i in range(n_models)]
+    assert len(model_names) == n_models
 
-    X0 = np.asarray(Ms[0]["states"])
-    Nref, Nt = X0.shape[0], X0.shape[1]
-    t, dt = _get_tvec(Ms[0], Nt)
+    Ms = [load_mat(p) for p in mat_paths]
+
+    # Reference episode count from first file
+    Nref = np.asarray(Ms[0]["states"]).shape[0]
+
+    # Per-model time vectors and Nt (may differ, e.g. 101 vs 100)
+    tvecs: List[np.ndarray] = []
+    dts: List[float] = []
+    Nts: List[int] = []
+    for M in Ms:
+        Nt_m = np.asarray(M["states"]).shape[1]
+        Nts.append(Nt_m)
+        t_m, dt_m = _get_tvec(M, Nt_m)
+        tvecs.append(t_m)
+        dts.append(dt_m)
 
     half_angle = np.deg2rad(cone_half_deg)
     alpha0 = np.deg2rad(alpha0_deg)
     alphaT = np.deg2rad(alpha0_deg + omega_deg * TOF)
 
-    # cone radius based on all methods so geometry matches
+    # Cone radius based on all methods so geometry matches
     rmax = 0.0
     for M in Ms:
         X = np.asarray(M["states"])
@@ -266,32 +353,46 @@ def plot_docking_threeway(
     cone_R = 1.05 * rmax if rmax > 0 else 1.0
 
     is_fail_list, k_fail_list, k_stop_list, u_totals_list = [], [], [], []
-    success_rates = []
+    is_docked_list = []
+    safety_rates = []
+    dock_rates = []
+    u_totals_docked_list = []
 
-    for M in Ms:
+    for idx_m, M in enumerate(Ms):
         X = np.asarray(M["states"])
-        if X.shape[0] != Nref or X.shape[1] != Nt:
-            raise ValueError("All .mat files must have matching (N, Nt) in `states`.")
+        N_m, Nt_m = X.shape[0], X.shape[1]
+        if N_m != Nref:
+            raise ValueError(
+                f"Model {idx_m} has N={N_m} episodes, expected {Nref}."
+            )
 
         is_fail, k_fail = _infer_failures(M)
+        is_docked = _infer_docking_success(M, is_fail, Nts[idx_m])
         k_stop = np.array([
-            _compute_kstop(M, i, Nt, bool(is_fail[i]), int(k_fail[i])) for i in range(Nref)
+            _compute_kstop(M, i, Nt_m, bool(is_fail[i]), int(k_fail[i]))
+            for i in range(Nref)
         ], dtype=int)
+        m_arr = np.asarray(M.get("m_vec", np.ones(Nref)), dtype=float).reshape(-1)
+        if m_arr.size != Nref:
+            m_arr = np.ones(Nref)
         u_totals = np.array([
-            _total_thrust(M, i, int(k_stop[i]), dt) for i in range(Nref)
+            _total_thrust(M, i, int(k_stop[i]), dts[idx_m], m=float(m_arr[i]))
+            for i in range(Nref)
         ], dtype=float)
+
+        # Fuel conditioned on successful docking (NaN for non-docked episodes)
+        u_docked = np.where(is_docked, u_totals, float("nan"))
 
         is_fail_list.append(is_fail)
         k_fail_list.append(k_fail)
         k_stop_list.append(k_stop)
         u_totals_list.append(u_totals)
+        is_docked_list.append(is_docked)
+        safety_rates.append(float(np.mean(~is_fail)))
+        dock_rates.append(float(np.mean(is_docked)))
+        u_totals_docked_list.append(u_docked)
 
-        success_rates.append(float(np.mean(~is_fail)))
-        
-        
-    
-
-    # global colour scale: success-only across all methods
+    # Global colour scale: success-only across all methods
     succ_u = []
     for u, f in zip(u_totals_list, is_fail_list):
         if np.any(~f):
@@ -317,16 +418,39 @@ def plot_docking_threeway(
 
     rng = np.random.default_rng(seed)
 
-    fig = plt.figure(figsize=(12, 7), dpi=120)
+    # --------------------------------
+    # Paper-quality rcParams
+    # --------------------------------
+    plt.rcParams.update({
+        "font.size": 18,
+        "axes.titlesize": 18,
+        "axes.labelsize": 24,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
+        "legend.fontsize": 12,
+        "lines.linewidth": 0.7,
+    })
+
+    fig = plt.figure(figsize=(5.5 * n_models, 9), dpi=300)
     fig.patch.set_facecolor("white")
 
     for col, (M, name, is_fail, k_fail, k_stop, u_totals) in enumerate(
-        zip(Ms, model_names, is_fail_list, k_fail_list, k_stop_list, u_totals_list), start=1
+        zip(Ms, model_names, is_fail_list, k_fail_list, k_stop_list, u_totals_list),
+        start=1,
     ):
+        Nt_m = Nts[col - 1]
+        t = tvecs[col - 1]
+
         idx_succ = np.where(~is_fail)[0]
         idx_fail = np.where(is_fail)[0]
-        idx_s = rng.choice(idx_succ, size=min(Nsucc_plot, idx_succ.size), replace=False) if idx_succ.size else np.array([], dtype=int)
-        idx_f = rng.choice(idx_fail, size=min(Nfail_plot, idx_fail.size), replace=False) if idx_fail.size else np.array([], dtype=int)
+        idx_s = (
+            rng.choice(idx_succ, size=min(Nsucc_plot, idx_succ.size), replace=False)
+            if idx_succ.size else np.array([], dtype=int)
+        )
+        idx_f = (
+            rng.choice(idx_fail, size=min(Nfail_plot, idx_fail.size), replace=False)
+            if idx_fail.size else np.array([], dtype=int)
+        )
         idx_plot = np.concatenate([idx_s, idx_f])
 
         X = np.asarray(M["states"])
@@ -334,12 +458,12 @@ def plot_docking_threeway(
         V = _as_2d(M.get("Vs", None))
 
         # Row 1: XY
-        ax1 = fig.add_subplot(3, 3, col)
+        ax1 = fig.add_subplot(3, n_models, col)
         ax1.grid(True, alpha=0.3)
         ax1.set_facecolor("white")
 
         for ii in idx_plot:
-            k_end_traj = int(k_fail[ii]) if is_fail[ii] else Nt
+            k_end_traj = int(k_fail[ii]) if is_fail[ii] else Nt_m
             tidx = np.arange(0, k_end_traj, stride_traj, dtype=int)
             if tidx.size < 2:
                 continue
@@ -354,11 +478,13 @@ def plot_docking_threeway(
         _plot_cones(ax1, cone_R, alpha0, alphaT, half_angle)
         ax1.set_aspect("equal", adjustable="box")
         ax1.set_title(name)
-        ax1.set_xlabel("x [m]")
-        ax1.set_ylabel("y [m]" if col == 1 else "")
+        ax1.set_xlabel("x [km]")
+        if col == 1:
+            ax1.set_ylabel("y [km]")
+
 
         # Row 2: h(t)
-        ax2 = fig.add_subplot(3, 3, col + 3)
+        ax2 = fig.add_subplot(3, n_models, col + n_models)
         ax2.grid(True, alpha=0.3)
         ax2.set_facecolor("white")
         if H is None:
@@ -384,16 +510,18 @@ def plot_docking_threeway(
                     continue
                 tt = t[tidx]
                 hseg = H[ii, tidx]
-                ax2.plot(tt, np.maximum(hseg, ylo), linewidth=0.9 if is_fail[ii] else 0.6, color=color_of(u_totals[ii]))
+                ax2.plot(
+                    tt, np.maximum(hseg, ylo),
+                    linewidth=0.9 if is_fail[ii] else 0.6,
+                    color=color_of(u_totals[ii]),
+                )
 
             ax2.axhline(0.0, linestyle="--", linewidth=0.8)
             ax2.set_ylim([ylo, yhi])
             ax2.set_ylabel("h(t)" if col == 1 else "")
-            if col == 1:
-                ax2.set_xlabel("t [s]")
 
         # Row 3: V(t)
-        ax3 = fig.add_subplot(3, 3, col + 6)
+        ax3 = fig.add_subplot(3, n_models, col + 2 * n_models)
         ax3.grid(True, alpha=0.3)
         ax3.set_facecolor("white")
         if V is None:
@@ -406,37 +534,78 @@ def plot_docking_threeway(
                 if tidx.size < 2:
                     continue
                 tt = t[tidx]
-                ax3.plot(tt, V[ii, tidx], linewidth=0.9 if is_fail[ii] else 0.6, color=color_of(u_totals[ii]))
+                ax3.plot(
+                    tt, V[ii, tidx],
+                    linewidth=0.9 if is_fail[ii] else 0.6,
+                    color=color_of(u_totals[ii]),
+                )
             ax3.set_ylabel("V(t)" if col == 1 else "")
             ax3.set_xlabel("t [s]")
 
-    # global colourbar
+    fig.subplots_adjust(hspace=0.75)
+
+    # Global colourbar
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=umin, vmax=umax))
     sm.set_array([])
     cax = fig.add_axes([0.93, 0.12, 0.015, 0.76])
     cb = fig.colorbar(sm, cax=cax)
-    cb.set_label(r"Total thrust (success-scaled)")
+    cb.set_label(r"$\Delta V$ [m/s]")
 
-    # violin plot
-    fig_v = plt.figure(figsize=(7, 3), dpi=120)
+    # Violin plot: all episodes (top) + docked episodes only (bottom)
+    fig_v = plt.figure(figsize=(max(4, 2.5 * n_models), 5), dpi=300)
     fig_v.patch.set_facecolor("white")
-    axv = fig_v.add_subplot(1, 1, 1)
-    axv.set_facecolor("white")
-    axv.grid(True, axis="y", alpha=0.3)
-    _violin_box(axv, u_totals_list, model_names)
-    axv.set_ylabel(r"Total thrust")
-    axv.set_title("Total thrust across all episodes")
+    axv1 = fig_v.add_subplot(2, 1, 1)
+    axv1.set_facecolor("white")
+    axv1.grid(True, axis="y", alpha=0.3)
+    _violin_box(axv1, u_totals_list, model_names)
+    axv1.set_ylabel(r"$\Delta V$ [m/s]")
+    axv1.set_title(r"$\Delta V$ [m/s] — all episodes")
 
-    latex_table = _latex_table_from_arrays(u_totals_list, model_names)
+    axv2 = fig_v.add_subplot(2, 1, 2)
+    axv2.set_facecolor("white")
+    axv2.grid(True, axis="y", alpha=0.3)
+    _violin_box(axv2, u_totals_docked_list, model_names)
+    axv2.set_ylabel(r"$\Delta V$ [m/s]")
+    axv2.set_title(r"$\Delta V$ [m/s] — docked episodes only")
+    fig_v.tight_layout()
+
+    safety_rates_pct = [sr * 100.0 for sr in safety_rates]
+    dock_rates_pct = [dr * 100.0 for dr in dock_rates]
+    latex_table = _latex_table_from_arrays(
+        u_totals_list,
+        model_names,
+        safety_rates=safety_rates_pct,
+        dock_rates=dock_rates_pct,
+        u_totals_docked=u_totals_docked_list,
+    )
 
     if save_prefix is not None:
-        fig.savefig(f"{save_prefix}_grid.png", bbox_inches="tight")
-        fig_v.savefig(f"{save_prefix}_violin.png", bbox_inches="tight")
+        fig.savefig(f"{save_prefix}_grid.png", dpi=300, bbox_inches="tight")
+        fig_v.savefig(f"{save_prefix}_violin.png", dpi=300, bbox_inches="tight")
 
     return {
         "latex_table": latex_table,
         "u_totals": u_totals_list,
-        "success_rates": success_rates,
+        "u_totals_docked": u_totals_docked_list,
+        "safety_rates": safety_rates_pct,   # barrier h(t) >= 0 throughout, % in [0, 100]
+        "dock_rates": dock_rates_pct,        # task completion (V <= threshold at term), % in [0, 100]
         "colour_scale": (umin, umax),
         "figs": {"main": fig, "violin": fig_v},
     }
+
+
+def plot_docking_threeway(
+    baseline_mat: str,
+    mlp_mat: str,
+    rnn_mat: str,
+    save_prefix: Optional[str] = None,
+    model_names: Tuple[str, str, str] = ("ICCBF", "MLP-tuned ICCBF", "RNN-tuned ICCBF"),
+    **kwargs,
+) -> Dict[str, Any]:
+    """Legacy 3-way wrapper around :func:`plot_docking_comparison`."""
+    return plot_docking_comparison(
+        mat_paths=[baseline_mat, mlp_mat, rnn_mat],
+        model_names=list(model_names),
+        save_prefix=save_prefix,
+        **kwargs,
+    )

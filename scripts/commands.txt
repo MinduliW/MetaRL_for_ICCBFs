@@ -1,0 +1,35 @@
+uv run python -m metarl_iccbf.docking.evaluation.cli \
+  --parallel \
+  --adversarial \
+  --model-path outputs/docking/LSTMTunedICCBF_Docking_20260317_142159_Adversarial/best_model.zip \
+  --policy-type RNN \
+  --algo ppo \
+  --ics-path outputs/data/docking/docking_episode_bank.npz \
+  --out-dir outputs/eval/docking \
+  --num-workers 8 \
+  --num-chunks 32 2>&1
+
+  Tables for docking
+python3 -c "
+from scipy.io import loadmat
+import numpy as np
+
+mat = loadmat('outputs/eval/docking/eval_LSTMTunedICCBF_Docking_20260317_142159_Adversarial_parallel_20260319_151917.mat')
+
+hs          = mat['hs']
+uTotal      = mat['uTotal'].ravel()
+docked      = mat['docked'].ravel()
+steps_taken = mat['steps_taken'].ravel()
+dt = 0.5
+
+N = hs.shape[0]
+safe = np.array([np.all(hs[i, :steps_taken[i]] >= 0) for i in range(N)])
+
+print('=== LSTM+PPO (Adversarial), TOF=100s ===')
+print(f'Safety rate : {100*np.mean(safe):.1f}%')
+print(f'Dock rate   : {100*np.mean(docked):.1f}%')
+print(f'Fuel mean±std   : {np.mean(uTotal):.3f} ± {np.std(uTotal):.3f}')
+print(f'Fuel median[Q25,Q75]: {np.median(uTotal):.3f} [{np.percentile(uTotal,25):.3f}, {np.percentile(uTotal,75):.3f}]')
+print(f'Fuel | docked   : -- (n=0)')
+print(f'Ep len mean/med : {np.mean(steps_taken*dt):.1f}s / {np.median(steps_taken*dt):.1f}s')
+" 2>&1

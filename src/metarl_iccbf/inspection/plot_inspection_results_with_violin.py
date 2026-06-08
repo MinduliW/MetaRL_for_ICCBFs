@@ -576,7 +576,19 @@ def plot_inspection_threeway(
         R_C, R_D, R_MAX = _get_RC_RD_RMAX(M, N)
 
         kStop, is_unsafe = _crop_kstop(X, steps_taken, R_C, R_D, R_MAX, hsun)
-        Utot_all = _total_thrust(U, kStop, _get_dt(M, default=dt))
+
+        m_vec = None
+        meta, names = _get_meta_params(M)
+        if meta is not None and names and "m" in [s.strip() for s in names]:
+            m_vec = meta[:, [s.strip() for s in names].index("m")]
+        else:
+            mv = _get_field(M, "m_vec", default=None)
+            if mv is not None and np.size(mv) > 0:
+                mv = np.asarray(mv, dtype=float).reshape(-1)
+                if mv.size == N:
+                    m_vec = mv
+
+        Utot_all = _total_dv(U, kStop, _get_dt(M, default=dt), m_vec=m_vec)
 
         # Task success based on inspected points at kStop
         if np.all(np.isnan(nins)):
@@ -734,14 +746,10 @@ def plot_inspection_threeway(
         # -------- row 2: hKOZ --------
         ax2 = fig.add_subplot(gs[1, col])
         plot_h(ax2, hKOZ, r"$h_{\mathrm{KOZ}}(t)$")
-        if col == 0:
-            ax2.set_xlabel("t [s]")
 
         # -------- row 3: hKIZ --------
         ax3 = fig.add_subplot(gs[2, col])
         plot_h(ax3, hKIZ, r"$h_{\mathrm{KIZ}}(t)$")
-        if col == 0:
-            ax3.set_xlabel("t [s]")
 
         # -------- row 4: hSUN --------
         ax4 = fig.add_subplot(gs[3, col])
@@ -750,8 +758,6 @@ def plot_inspection_threeway(
             ax4.text(0.05, 0.6, r"$h_{\mathrm{SUN}}(t)$ not available", transform=ax4.transAxes)
         else:
             plot_h(ax4, hsun, r"$h_{\mathrm{SUN}}(t)$")
-            if col == 0:
-                ax4.set_xlabel("t [s]")
 
         # -------- row 5: inspected % --------
         ax5 = fig.add_subplot(gs[4, col])
@@ -772,7 +778,6 @@ def plot_inspection_threeway(
             ax5.set_ylim([0, max(105, target_inspected + 5)])
             ax5.set_ylabel("Inspected [%]")
             ax5.set_xlabel("t [s]")
-            ax5.set_title("Inspection progress")
 
     # global colourbar
     sm = plt.cm.ScalarMappable(cmap=cmap)

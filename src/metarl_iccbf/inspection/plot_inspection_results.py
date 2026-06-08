@@ -346,30 +346,48 @@ def _latex_table(values_by_method: Sequence[np.ndarray],
                  names: Sequence[str],
                  caption: str,
                  label: str,
-                 fmt: str = "{:.2f}") -> str:
+                 fmt: str = "{:.2f}",
+                 safety_rates: Optional[Sequence[float]] = None) -> str:
     lines = []
-    lines.append(r"\begin{table}[hbt!]")
+    lines.append(r"\begin{table}[H]")
     lines.append(r"\centering")
     lines.append(rf"\caption{{{caption}}}")
     lines.append(rf"\label{{{label}}}")
-    lines.append(r"\begin{tabular}{lll}")
-    lines.append(r"Case & [$\mu$ $\pm$ $\sigma$] & [$Q_1, Q_2, Q_3, P_{99}$] \\ \hline")
+    if safety_rates is not None:
+        lines.append(r"\begin{tabular}{llll}")
+        lines.append(r"\toprule")
+        lines.append(r"Case & [$\mu$ $\pm$ $\sigma$] & [$Q_1, Q_2, Q_3, P_{99}$] & Safety \% \\")
+        lines.append(r"\midrule")
+    else:
+        lines.append(r"\begin{tabular}{lll}")
+        lines.append(r"\toprule")
+        lines.append(r"Case & [$\mu$ $\pm$ $\sigma$] & [$Q_1, Q_2, Q_3, P_{99}$] \\")
+        lines.append(r"\midrule")
 
-    for name, v in zip(names, values_by_method):
+    for j, (name, v) in enumerate(zip(names, values_by_method)):
         v = np.asarray(v, dtype=float)
         v = v[np.isfinite(v)]
+        sr_str = f"{float(safety_rates[j]):.1f}" if safety_rates is not None else None
         if v.size == 0:
-            lines.append(rf"{name} & -- & -- \\")
+            if sr_str is not None:
+                lines.append(rf"{name} & -- & -- & {sr_str} \\")
+            else:
+                lines.append(rf"{name} & -- & -- \\")
             continue
         mu = float(np.mean(v))
         sd = float(np.std(v, ddof=1)) if v.size > 1 else 0.0
         q1, q2, q3, p99 = np.percentile(v, [25, 50, 75, 99]).tolist()
-        lines.append(
+        row = (
             rf"{name} & {fmt.format(mu)} $\pm$ {fmt.format(sd)} & "
-            rf"[{fmt.format(q1)}, {fmt.format(q2)}, {fmt.format(q3)}, {fmt.format(p99)}] \\"
+            rf"[{fmt.format(q1)}, {fmt.format(q2)}, {fmt.format(q3)}, {fmt.format(p99)}]"
         )
+        if sr_str is not None:
+            row += rf" & {sr_str} \\"
+        else:
+            row += r" \\"
+        lines.append(row)
 
-    lines.append(r"\hline")
+    lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
     lines.append(r"\end{table}")
     return "\n".join(lines)
@@ -407,13 +425,10 @@ def _plot_kiz_annulus(ax, Rlo: float, Rhi: float):
     ax.plot(Rhi*np.cos(th), Rhi*np.sin(th), linestyle=":", linewidth=1.0)
 
 
-def plot_inspection_threeway(
-    *,
-    baseline_mat: str,
-    mlp_mat: str,
-    rnn_mat: str,
+def plot_inspection_comparison(
+    mat_paths: Sequence[str],
+    model_names: Optional[Sequence[str]] = None,
     save_prefix: Optional[str] = None,
-    model_names: Sequence[str] = ("ICCBF", "MLP-tuned ICCBF", "RNN-tuned ICCBF"),
     stride_traj: int = 5,
     stride_ts: int = 5,
     Nsucc_plot: int = 500,
@@ -425,11 +440,23 @@ def plot_inspection_threeway(
     kiz_band: float = 0.10,
 ) -> Dict[str, Any]:
     """
-    Loads three .mat files and produces:
-      - main 5x3 plot
+    Loads N .mat files and produces:
+      - main 5×N plot
       - returns summary + LaTeX tables
+
+    Parameters
+    ----------
+    mat_paths : sequence of str
+        Paths to .mat result files (any number >= 1).
+    model_names : sequence of str or None
+        Display names; defaults to ``["Model 0", "Model 1", ...]``.
     """
-    paths = [baseline_mat, mlp_mat, rnn_mat]
+    n_models = len(mat_paths)
+    if model_names is None:
+        model_names = [f"Model {i}" for i in range(n_models)]
+    assert len(model_names) == n_models, "model_names length must match mat_paths"
+
+    paths = list(mat_paths)
     models = [loadmat(p) for p in paths]
 
     # Infer dt/TOF per model; use first model for time axis if present
@@ -544,11 +571,18 @@ def plot_inspection_threeway(
     plt.rcParams.update({
         "figure.facecolor": "white",
         "axes.facecolor": "white",
-        "font.size": 10,
+        "font.size": 18,
+        "axes.titlesize": 18,
+        "axes.labelsize": 24,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
+        "legend.fontsize": 12,
+        "lines.linewidth": 0.7,
     })
 
-    fig = plt.figure(figsize=(12.8, 10.3), dpi=110)
-    gs = fig.add_gridspec(5, 3, wspace=0.28, hspace=0.35)
+    fig = plt.figure(figsize=(5.5 * n_models, 14), dpi=300)
+    gs = fig.add_gridspec(6, n_models, wspace=0.28, hspace=0.38,
+                          height_ratios=[1.4, 0.25, 1, 1, 1, 1])
 
     RkizLo = (1.0 - kiz_band) * kiz_nominal
     RkizHi = (1.0 + kiz_band) * kiz_nominal
@@ -596,18 +630,11 @@ def plot_inspection_threeway(
         _plot_kiz_annulus(ax1, RkizLo, RkizHi)
         ax1.set_aspect("equal", adjustable="box")
         ax1.set_xlabel("x [m]")
-        ax1.set_ylabel("y [m]")
+        if col == 0:
+            ax1.set_ylabel("y [m]")
         ax1.set_title(name)
 
-        # legend counts
-        nFail_full = int(np.sum(~P["is_success"]))
-        nSucc_full = int(np.sum(P["is_success"]))
-        ax1.plot([], [], "k--", linewidth=0.9, label=f"Task fail ({nFail_full})")
-        ax1.plot([], [], "k-",  linewidth=0.6, label=f"Task success ({nSucc_full})")
-        ax1.plot([], [], "k:",  linewidth=1.0, label=f"KIZ band ({kiz_nominal:g} ± {100*kiz_band:g}%)")
-        # ax1.legend(loc="lower center", bbox_to_anchor=(0.5, -0.42), ncol=1, frameon=False)
-
-        # -------- helper for rows 2-4 --------
+        # Patch plot_h to only set ylabel on first column
         def plot_h(ax, H, ylabel):
             ax.grid(True)
             # y-limits from percentile across plotted traces
@@ -641,32 +668,27 @@ def plot_inspection_threeway(
                 ax.plot(tt, Hdisp, linewidth=0.7, color=colorOf(Utot_plot[j]))
             ax.axhline(0.0, linestyle="--", linewidth=0.8, color="k")
             ax.set_ylim([ylo, yhi])
-            ax.set_ylabel(ylabel)
+            if col == 0:
+                ax.set_ylabel(ylabel)
 
         # -------- row 2: hKOZ --------
-        ax2 = fig.add_subplot(gs[1, col])
+        ax2 = fig.add_subplot(gs[2, col])
         plot_h(ax2, hKOZ, r"$h_{\mathrm{KOZ}}(t)$")
-        if col == 0:
-            ax2.set_xlabel("t [s]")
 
         # -------- row 3: hKIZ --------
-        ax3 = fig.add_subplot(gs[2, col])
+        ax3 = fig.add_subplot(gs[3, col])
         plot_h(ax3, hKIZ, r"$h_{\mathrm{KIZ}}(t)$")
-        if col == 0:
-            ax3.set_xlabel("t [s]")
 
         # -------- row 4: hSUN --------
-        ax4 = fig.add_subplot(gs[3, col])
+        ax4 = fig.add_subplot(gs[4, col])
         if np.all(np.isnan(hsun)):
             ax4.axis("off")
             ax4.text(0.05, 0.6, r"$h_{\mathrm{SUN}}(t)$ not available", transform=ax4.transAxes)
         else:
             plot_h(ax4, hsun, r"$h_{\mathrm{SUN}}(t)$")
-            if col == 0:
-                ax4.set_xlabel("t [s]")
 
         # -------- row 5: inspected % --------
-        ax5 = fig.add_subplot(gs[4, col])
+        ax5 = fig.add_subplot(gs[5, col])
         if np.all(np.isnan(nins)):
             ax5.axis("off")
             ax5.text(0.05, 0.6, r"num\_inspected not available", transform=ax5.transAxes)
@@ -682,16 +704,17 @@ def plot_inspection_threeway(
                 ax5.plot(tt, nins[ii, tidx], linewidth=0.9, color=colorOf(Utot_plot[j]))
             ax5.axhline(target_inspected, linestyle=":", linewidth=0.8, color="k")
             ax5.set_ylim([0, max(105, target_inspected + 5)])
-            ax5.set_ylabel("Inspected [%]")
+            if col == 0:
+                ax5.set_ylabel("Inspected [%]")
             ax5.set_xlabel("t [s]")
-            ax5.set_title("Inspection progress")
 
-    # global colourbar
+    # global colourbar (right of figure; width/position scale with n_models)
     sm = plt.cm.ScalarMappable(cmap=cmap)
     sm.set_clim(vmin=umin_global, vmax=umax_global)
-    cax = fig.add_axes([0.93, 0.07, 0.012, 0.88])
+    fig.subplots_adjust(right=0.88)
+    cax = fig.add_axes([0.90, 0.07, 0.012, 0.88])
     cb = fig.colorbar(sm, cax=cax)
-    cb.set_label(r"Total thrust $\int \|u\|\,dt$ (task-success-scaled, log-mapped)")
+    cb.set_label(r"$\Delta V$ [m/s]")
 
     fig_paths = {}
 
@@ -699,7 +722,7 @@ def plot_inspection_threeway(
         import os
         os.makedirs(os.path.dirname(save_prefix), exist_ok=True) if os.path.dirname(save_prefix) else None
         main_path = f"{save_prefix}_main.png"
-        fig.savefig(main_path, bbox_inches="tight")
+        fig.savefig(main_path, dpi=300, bbox_inches="tight")
         fig_paths["main"] = main_path
 
     # ---------------- summary stats + latex ----------------
@@ -718,10 +741,22 @@ def plot_inspection_threeway(
                 vals[i] = nins[i, kEnd-1]
             nFinal_full.append(vals)
 
-    latex_thrust = _latex_table(uTotals_full, model_names, "Inspection Thrust Consumption", "InspectionTT")
-    latex_pts = _latex_table(nFinal_full, model_names, "Final Number of Points Inspected", "InspectionPtsFinal")
+    success_rates_frac = [float(np.mean(P["is_success"])) for P in per]
+    success_rates_pct = [sr * 100.0 for sr in success_rates_frac]
+    print("Success rates:")
+    for name, sr in zip(model_names, success_rates_pct):
+        print(f"  {name}: {sr:.1f}%")
 
-    success_rates = [float(np.mean(P["is_success"])) for P in per]
+    latex_thrust = _latex_table(
+        uTotals_full, model_names,
+        r"Inspection $\Delta v$ Consumption (m/s)", "InspectionDV",
+        safety_rates=success_rates_pct,
+    )
+    latex_pts = _latex_table(
+        nFinal_full, model_names,
+        "Final Number of Points Inspected", "InspectionPtsFinal",
+        safety_rates=success_rates_pct,
+    )
 
     out = {
         "fig": fig,
@@ -729,8 +764,24 @@ def plot_inspection_threeway(
         "latex_table": latex_thrust + "\n\n" + latex_pts,
         "latex_table_thrust": latex_thrust,
         "latex_table_points": latex_pts,
-        "success_rates": success_rates,
+        "success_rates": success_rates_pct,  # % in [0, 100]
         "umin_global": umin_global,
         "umax_global": umax_global,
     }
     return out
+
+
+def plot_inspection_threeway(
+    *,
+    baseline_mat: str,
+    mlp_mat: str,
+    rnn_mat: str,
+    model_names: Sequence[str] = ("ICCBF", "MLP-tuned ICCBF", "RNN-tuned ICCBF"),
+    **kwargs,
+) -> Dict[str, Any]:
+    """Legacy 3-model wrapper. Delegates to :func:`plot_inspection_comparison`."""
+    return plot_inspection_comparison(
+        mat_paths=[baseline_mat, mlp_mat, rnn_mat],
+        model_names=list(model_names),
+        **kwargs,
+    )

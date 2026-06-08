@@ -101,7 +101,7 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
         lstm_kwargs: Optional[dict[str, Any]] = None,
         # --- Mamba2-specific ---
         mamba_d_model: int = 64,
-        mamba_d_state: int = 64,
+        mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
         mamba_headdim: int = 64,
@@ -200,8 +200,10 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
         )
 
         # ---- rebuild optimizer with *all* new parameters ----
+        # The parent class optimizer was created before the Mamba2 modules,
+        # so we need to rebuild it to include the new parameters.
         self.optimizer = self.optimizer_class(
-            self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
+            self.parameters(), **self.optimizer_kwargs
         )
 
     # ------------------------------------------------------------------
@@ -303,6 +305,46 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
         packed_out = self._pack_states(conv_state, ssm_state)
         return output, packed_out
 
+    def _process_sequence_mamba_scan(
+        self,
+        features: th.Tensor,
+        packed_states: tuple[th.Tensor, th.Tensor],
+        episode_starts: th.Tensor,
+        mamba: Mamba2,
+        proj: nn.Linear,
+    ) -> th.Tensor:
+        """Parallel-scan Mamba2 processing for training.
+
+        Uses ``mamba.forward()`` with ``seq_idx`` to handle episode boundaries
+        in a single fused kernel call, instead of stepping through each timestep.
+        Does not return final states (not needed during PPO training).
+        """
+        n_seq = packed_states[0].shape[1]
+        max_len = features.shape[0] // n_seq
+
+        # Reshape to (n_seq, max_len, feat_dim)
+        features_batch = features.reshape(n_seq, max_len, -1)
+        episode_starts_batch = episode_starts.reshape(n_seq, max_len)
+
+        # Build seq_idx for episode-boundary resets.  Only pass it to the
+        # kernel when there are actual mid-sequence resets, because the
+        # causal_conv1d seq_idx code path has a CUDA bug that causes
+        # intermittent illegal-memory-access errors (causal_conv1d 1.6.0).
+        episode_starts_batch = episode_starts_batch.clone()
+        episode_starts_batch[:, 0] = 1.0
+        seq_idx = episode_starts_batch.cumsum(dim=1).int() - 1  # (n_seq, max_len)
+        has_boundaries = seq_idx.max() > 0
+
+        # Project features → d_model, then run parallel scan
+        projected = proj(features_batch)           # (n_seq, max_len, d_model)
+        if has_boundaries:
+            out = mamba(projected, seq_idx=seq_idx)
+        else:
+            out = mamba(projected)
+
+        # Flatten back to (n_seq * max_len, d_model)
+        return out.reshape(n_seq * max_len, -1)
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -363,12 +405,12 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
         else:
             pi_features, vf_features = features
 
-        latent_pi, _ = self._process_sequence_mamba(
+        latent_pi = self._process_sequence_mamba_scan(
             pi_features, lstm_states.pi, episode_starts,
             self.mamba_actor, self.proj_actor,
         )
         if self.mamba_critic is not None:
-            latent_vf, _ = self._process_sequence_mamba(
+            latent_vf = self._process_sequence_mamba_scan(
                 vf_features, lstm_states.vf, episode_starts,
                 self.mamba_critic, self.proj_critic,
             )
@@ -394,7 +436,7 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
         obs: th.Tensor,
         lstm_states: tuple[th.Tensor, th.Tensor],
         episode_starts: th.Tensor,
-    ) -> tuple[Distribution, tuple[th.Tensor, ...]]:
+    ) -> tuple[Distribution, tuple[th.Tensor, th.Tensor]]:
         features = super(ActorCriticPolicy, self).extract_features(
             obs, self.pi_features_extractor
         )
@@ -450,10 +492,10 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
     def predict(
         self,
         observation: Union[np.ndarray, dict[str, np.ndarray]],
-        state: Optional[tuple[np.ndarray, ...]] = None,
+        state: Optional[tuple[np.ndarray, np.ndarray]] = None,
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
-    ) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
+    ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
         self.set_training_mode(False)
 
         observation, vectorized_env = self.obs_to_tensor(observation)
@@ -464,11 +506,11 @@ class Mamba2ActorCriticPolicy(ActorCriticPolicy):
             n_envs = observation.shape[0]
 
         if state is None:
-            state = np.concatenate(
+            state_array = np.concatenate(
                 [np.zeros(self.lstm_hidden_state_shape) for _ in range(n_envs)],
                 axis=1,
             )
-            state = (state, state)
+            state = (state_array, state_array)
 
         if episode_start is None:
             episode_start = np.array([False for _ in range(n_envs)])

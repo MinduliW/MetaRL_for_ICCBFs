@@ -14,8 +14,7 @@ dependencies = [
     "sb3-contrib>=2.6.0",
     "gymnasium>=0.29.1",
     "ale-py>=0.10.2",
-    "imitation>=1.0.0",
-    "seals>=0.2.1",
+
     "shimmy>=0.2.1",
     # Hugging Face integration
     "huggingface-hub>=1.3.0",
@@ -36,6 +35,7 @@ dependencies = [
     "optuna>=4.4.0",
     "sacred>=0.8.7",
     "tensorboard>=2.19.0",
+    "wandb>=0.16.0",
     # Utilities
     "matplotlib>=3.10.1",
     "opencv-python>=4.11.0.86",
@@ -51,6 +51,7 @@ dependencies = [
     "mamba-ssm[causal-conv1d]",
     "symengine>=0.14.1",
     "daceypy>=1.3.0",
+    "mo-gymnasium>=1.3.0",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +65,13 @@ envs = [
     "box2d-py>=2.3.5",
 ]
 
+[project.scripts]
+metarl-train = "metarl_iccbf.cruise_control.training.cli:main"
+metarl-train-inspection = "metarl_iccbf.inspection.training.cli:main"
+metarl-eval-inspection = "metarl_iccbf.inspection.evaluation.cli:main"
+metarl-train-docking = "metarl_iccbf.docking.training.train:main"
+metarl-eval-docking = "metarl_iccbf.docking.evaluation.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -76,6 +84,7 @@ packages = ["src/metarl_iccbf"]
 
 [tool.uv]
 no-build-isolation-package = ["mamba-ssm", "causal-conv1d"]
+environments = ["sys_platform == 'linux'"]
 
 [tool.ruff]
 line-length = 100
